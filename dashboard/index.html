@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="it" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M2M Ledger — Live Market</title>
+
+<!-- Tailwind CSS v4 (Play CDN, zero build step) -->
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+
+<!-- Supabase JS v2. IMPORTANTE: caricato come <script> classico, NON come
+     type="module" con l'import "+esm" -- quella via ha un bug noto e
+     documentato (dicembre 2025) che rompe l'inizializzazione del client nel
+     browser. Questo tag espone una variabile globale `supabase`. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<!-- IBM Plex: Sans per l'interfaccia, Mono per i dati numerici (la stessa
+     famiglia disegnata per contesti tecnici/finanziari -- niente Inter di
+     default). -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style type="text/tailwindcss">
+  @theme {
+    --color-base: #0a0d14;
+    --color-surface: #12151f;
+    --color-surface-2: #191d2a;
+    --color-hairline: #232838;
+    --color-accent: #f0b429;
+    --color-accent-dim: #8a661c;
+    --color-positive: #10b981;
+    --color-negative: #ef4444;
+    --color-text-primary: #e7e9ee;
+    --color-text-muted: #737b8f;
+    --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+  }
+</style>
+
+<style>
+  /* Dettagli che l'utility-first di Tailwind non copre in modo pulito. */
+  html, body { background-color: var(--color-base); }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  .status-dot { animation: pulse-dot 2s ease-in-out infinite; }
+
+  /* Griglia sottilissima sullo sfondo: allude al "graph paper" di un
+     terminale, deliberatamente quasi invisibile. */
+  .grid-texture {
+    background-image:
+      linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--color-base); }
+  ::-webkit-scrollbar-thumb { background: var(--color-surface-2); border-radius: 999px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+</style>
+</head>
+
+<body class="min-h-screen bg-base text-text-primary font-sans antialiased grid-texture">
+
+  <!-- ============================================================
+       CONFIGURAZIONE -- le uniche due righe da modificare.
+       ============================================================
+       SUPABASE_ANON_KEY qui dentro e' la chiave "anon" (pubblica),
+       MAI la "service_role": questo file gira nel browser di chiunque
+       lo apra, chiave leggibile da chiunque guardi il sorgente della
+       pagina. La service_role bypassa la sicurezza a livello di riga
+       (RLS) e puo' scrivere ovunque: se finisse qui, chiunque potrebbe
+       manipolare il ledger. La trovi in Supabase -> Project Settings
+       -> API -> "anon public".
+
+       Questa tabella, per come l'abbiamo definita in schema.sql, non ha
+       ancora una policy che permetta la LETTURA pubblica: senza,
+       questa dashboard restituisce zero righe (o un errore di
+       permessi). Esegui una tantum nell'SQL Editor di Supabase:
+
+         ALTER TABLE m2m_wallets ENABLE ROW LEVEL SECURITY;
+
+         CREATE POLICY "Lettura pubblica dei saldi (dashboard)"
+         ON m2m_wallets FOR SELECT
+         TO anon
+         USING (true);
+
+       Questo concede SOLO la lettura al ruolo anon: le scritture
+       restano possibili solo tramite le funzioni SECURITY DEFINER
+       usate dal broker (service_role), che questa policy non tocca.
+  -->
+  <script>
+    const SUPABASE_URL = "https://ujabcxouuycafuagqbmy.supabase.co";
+    const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVqYWJjeG91dXljYWZ1YWdxYm15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM5NjEzMDYsImV4cCI6MjA5OTUzNzMwNn0.H56u_4vEsfFMc1FW3WBuxhfd0qTqN1iQST767PgNCeE";
+  </script>
+
+  <div class="mx-auto max-w-6xl px-6 py-8">
+
+    <!-- ===================== HEADER ===================== -->
+    <header class="flex flex-wrap items-center justify-between gap-4 border-b border-hairline pb-6">
+      <div class="flex items-center gap-3">
+        <div class="flex h-9 w-9 items-center justify-center rounded border border-accent-dim/60 text-accent font-mono font-semibold">
+          M2
+        </div>
+        <div>
+          <h1 class="font-mono text-lg font-semibold tracking-tight text-text-primary">M2M LEDGER</h1>
+          <p class="text-xs text-text-muted">Mercato Machine-to-Machine — sessione live</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-5 font-mono text-xs">
+        <div id="status-pill" class="flex items-center gap-2 rounded-full border border-hairline bg-surface px-3 py-1.5">
+          <span id="status-dot" class="status-dot h-2 w-2 rounded-full bg-text-muted"></span>
+          <span id="status-text" class="text-text-muted tracking-wide">CONNESSIONE…</span>
+        </div>
+        <div id="clock" class="text-text-muted tabular-nums">--:--:--</div>
+      </div>
+    </header>
+
+    <!-- ===================== BANNER DI STATO (nascosto finche' non serve) ===================== -->
+    <div id="banner" class="mt-6 hidden rounded-lg border px-4 py-3 text-sm"></div>
+
+    <!-- ===================== STATISTICHE ===================== -->
+    <section class="mt-8 grid grid-cols-1 gap-px overflow-hidden rounded-lg border border-hairline bg-hairline sm:grid-cols-3">
+      <div class="bg-surface px-6 py-5">
+        <p class="text-xs uppercase tracking-widest text-text-muted">Totale in circolazione</p>
+        <p id="stat-total" class="mt-2 font-mono text-3xl font-semibold text-accent tabular-nums">$0.000000</p>
+      </div>
+      <div class="bg-surface px-6 py-5">
+        <p class="text-xs uppercase tracking-widest text-text-muted">Wallet attivi</p>
+        <p id="stat-count" class="mt-2 font-mono text-3xl font-semibold tabular-nums">0</p>
+      </div>
+      <div class="bg-surface px-6 py-5">
+        <p class="text-xs uppercase tracking-widest text-text-muted">Ultimo aggiornamento</p>
+        <p id="stat-updated" class="mt-2 font-mono text-3xl font-semibold tabular-nums">—</p>
+      </div>
+    </section>
+
+    <!-- ===================== TABELLA WALLET ===================== -->
+    <section class="mt-6 overflow-hidden rounded-lg border border-hairline bg-surface">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-hairline text-left text-xs uppercase tracking-widest text-text-muted">
+            <th class="px-6 py-3 font-medium">Passaporto</th>
+            <th class="px-6 py-3 font-medium text-right">Saldo</th>
+            <th class="px-6 py-3 font-medium text-right">Ultimo movimento</th>
+          </tr>
+        </thead>
+        <tbody id="wallets-body"><!-- righe iniettate da JS --></tbody>
+      </table>
+
+      <div id="empty-state" class="hidden px-6 py-16 text-center">
+        <p class="text-text-primary">Nessun wallet trovato.</p>
+        <p class="mt-1 text-sm text-text-muted">Un wallet compare qui alla prima transazione registrata sul broker.</p>
+      </div>
+    </section>
+
+    <footer class="mt-6 flex items-center justify-between text-xs text-text-muted">
+      <span>Polling ogni 2s · dati letti direttamente da Supabase (tabella <code class="font-mono">m2m_wallets</code>)</span>
+      <span id="version-tag" class="font-mono">m2m-ledger dashboard</span>
+    </footer>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  const POLL_INTERVAL_MS = 2000;
+  const FLASH_DURATION_MS = 500;
+  const DECIMALS = 6;
+
+  const el = {
+    body: document.getElementById("wallets-body"),
+    empty: document.getElementById("empty-state"),
+    banner: document.getElementById("banner"),
+    statusDot: document.getElementById("status-dot"),
+    statusText: document.getElementById("status-text"),
+    clock: document.getElementById("clock"),
+    statTotal: document.getElementById("stat-total"),
+    statCount: document.getElementById("stat-count"),
+    statUpdated: document.getElementById("stat-updated"),
+  };
+
+  // passaporto -> { tr, balanceCell, balanceValue, updatedCell }
+  const rows = new Map();
+  // passaporto -> ultimo saldo noto (per rilevare le variazioni tra un poll e l'altro)
+  const lastBalances = new Map();
+
+  let dbClient = null;
+  let lastSuccessfulFetch = null;
+
+  // ---------------------------------------------------------------
+  // Utility di formattazione
+  // ---------------------------------------------------------------
+  function formatUsd(n) {
+    const v = Number(n);
+    const sign = v < 0 ? "-" : "";
+    return `${sign}$${Math.abs(v).toFixed(DECIMALS)}`;
+  }
+
+  function formatRelativeTime(iso) {
+    if (!iso) return "—";
+    const diffSec = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (diffSec < 2) return "ora";
+    if (diffSec < 60) return `${diffSec}s fa`;
+    const diffMin = Math.round(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}min fa`;
+    const diffH = Math.round(diffMin / 60);
+    return `${diffH}h fa`;
+  }
+
+  function truncatePassport(p) {
+    return p && p.length > 28 ? p.slice(0, 25) + "…" : p;
+  }
+
+  // ---------------------------------------------------------------
+  // Banner / stato di connessione
+  // ---------------------------------------------------------------
+  function showBanner(kind, message) {
+    const palette = {
+      config: "border-accent-dim/60 bg-accent-dim/10 text-accent",
+      error: "border-negative/40 bg-negative/10 text-negative",
+    };
+    el.banner.className = `mt-6 rounded-lg border px-4 py-3 text-sm font-mono ${palette[kind] || palette.error}`;
+    el.banner.textContent = message;
+    el.banner.classList.remove("hidden");
+  }
+
+  function hideBanner() {
+    el.banner.classList.add("hidden");
+  }
+
+  function setStatus(state) {
+    const map = {
+      connecting: { dot: "bg-text-muted", text: "text-text-muted", label: "CONNESSIONE…" },
+      live: { dot: "bg-positive", text: "text-positive", label: "LIVE" },
+      error: { dot: "bg-negative", text: "text-negative", label: "ERRORE" },
+    };
+    const s = map[state] || map.connecting;
+    el.statusDot.className = `status-dot h-2 w-2 rounded-full ${s.dot}`;
+    el.statusText.className = `${s.text} tracking-wide`;
+    el.statusText.textContent = s.label;
+  }
+
+  // ---------------------------------------------------------------
+  // Orologio -- puramente decorativo, rinforza la sensazione di "live"
+  // indipendentemente dal ciclo di polling.
+  // ---------------------------------------------------------------
+  function tickClock() {
+    el.clock.textContent = new Date().toLocaleTimeString("it-IT", { hour12: false });
+    // aggiorna anche i tempi relativi nelle righe gia' renderizzate, cosi'
+    // "3s fa" cresce anche tra un poll e l'altro, non solo quando arrivano
+    // dati nuovi.
+    for (const refs of rows.values()) {
+      if (refs.updatedIso) refs.updatedCell.textContent = formatRelativeTime(refs.updatedIso);
+    }
+    if (lastSuccessfulFetch) {
+      el.statUpdated.textContent = formatRelativeTime(lastSuccessfulFetch);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Creazione/aggiornamento righe (rendering "a chiave", non ricostruzione
+  // totale: serve una riga STABILE nel tempo perche' la transizione CSS del
+  // flash funzioni, e per evitare sfarfallii ad ogni poll).
+  // ---------------------------------------------------------------
+  function creaRiga(passport) {
+    const tr = document.createElement("tr");
+    tr.className = "border-b border-hairline last:border-b-0";
+    tr.style.backgroundColor = "transparent";
+
+    const tdPassport = document.createElement("td");
+    tdPassport.className = "px-6 py-4 font-mono text-text-primary";
+    tdPassport.textContent = truncatePassport(passport);
+    tdPassport.title = passport;
+
+    const tdBalance = document.createElement("td");
+    tdBalance.className = "relative px-6 py-4 text-right";
+    const balanceValue = document.createElement("span");
+    balanceValue.className = "font-mono text-base font-medium tabular-nums";
+    tdBalance.appendChild(balanceValue);
+
+    const tdUpdated = document.createElement("td");
+    tdUpdated.className = "px-6 py-4 text-right font-mono text-xs text-text-muted tabular-nums";
+
+    tr.append(tdPassport, tdBalance, tdUpdated);
+
+    return { tr, balanceCell: tdBalance, balanceValue, updatedCell: tdUpdated, updatedIso: null };
+  }
+
+  function flashRow(refs, delta) {
+    const isIncrease = delta > 0;
+    const flashColor = isIncrease ? "rgba(16, 185, 129, 0.24)" : "rgba(239, 68, 68, 0.24)";
+
+    refs.tr.style.transition = "background-color 0ms linear";
+    refs.tr.style.backgroundColor = flashColor;
+    void refs.tr.offsetWidth; // forza il reflow: applica il colore PRIMA di riattivare la transizione
+    refs.tr.style.transition = `background-color ${FLASH_DURATION_MS}ms ease-out`;
+    refs.tr.style.backgroundColor = "transparent";
+
+    const deltaTag = document.createElement("span");
+    deltaTag.textContent = `${isIncrease ? "+" : "\u2212"}$${Math.abs(delta).toFixed(DECIMALS)}`;
+    deltaTag.className = [
+      "pointer-events-none absolute -top-1 right-6 font-mono text-xs font-medium",
+      isIncrease ? "text-positive" : "text-negative",
+      "transition-all duration-700 ease-out",
+    ].join(" ");
+    deltaTag.style.opacity = "1";
+    deltaTag.style.transform = "translateY(0px)";
+    refs.balanceCell.appendChild(deltaTag);
+
+    const raf = window.requestAnimationFrame || function (cb) { return setTimeout(cb, 16); };
+    raf(() => {
+      raf(() => {
+        deltaTag.style.opacity = "0";
+        deltaTag.style.transform = "translateY(-10px)";
+      });
+    });
+    setTimeout(() => deltaTag.remove(), 900);
+  }
+
+  function render(wallets) {
+    const seen = new Set();
+
+    for (const w of wallets) {
+      seen.add(w.passport);
+      try {
+        // Un solo wallet "strano" (dato malformato, un effetto di
+        // animazione che fallisce in qualche contesto insolito) non deve
+        // bloccare l'aggiornamento di TUTTI gli altri nella stessa
+        // risposta: senza questo try/catch, un'eccezione qui uscirebbe
+        // dal ciclo, lascerebbe le righe successive non aggiornate per
+        // questo giro, e verrebbe scambiata da tick() per un errore di
+        // connessione (banner rosso) quando la connessione era perfetta.
+        let refs = rows.get(w.passport);
+        if (!refs) {
+          refs = creaRiga(w.passport);
+          rows.set(w.passport, refs);
+          el.body.appendChild(refs.tr);
+        }
+
+        refs.balanceValue.textContent = formatUsd(w.balance);
+        refs.updatedIso = w.updated_at || null;
+        refs.updatedCell.textContent = formatRelativeTime(refs.updatedIso);
+
+        const prev = lastBalances.get(w.passport);
+        if (prev !== undefined && Math.abs(prev - w.balance) > 1e-9) {
+          flashRow(refs, w.balance - prev);
+        }
+        lastBalances.set(w.passport, w.balance);
+      } catch (rowErr) {
+        console.error("Rendering del wallet fallito, proseguo con gli altri:", w.passport, rowErr);
+      }
+    }
+
+    // rimuove righe di passaporti non piu' presenti nella risposta
+    for (const [passport, refs] of rows) {
+      if (!seen.has(passport)) {
+        refs.tr.remove();
+        rows.delete(passport);
+        lastBalances.delete(passport);
+      }
+    }
+
+    el.empty.classList.toggle("hidden", wallets.length > 0);
+    el.body.parentElement.classList.toggle("hidden", wallets.length === 0);
+
+    const totale = wallets.reduce((acc, w) => acc + Number(w.balance), 0);
+    el.statTotal.textContent = formatUsd(totale);
+    el.statCount.textContent = String(wallets.length);
+    lastSuccessfulFetch = new Date().toISOString();
+    el.statUpdated.textContent = formatRelativeTime(lastSuccessfulFetch);
+  }
+
+  // ---------------------------------------------------------------
+  // Rete: un fetch = una riga di verita'. Nessuno stato scritto se fallisce.
+  // ---------------------------------------------------------------
+  async function fetchWallets() {
+    const { data, error } = await dbClient
+      .from("m2m_wallets")
+      .select("passport, balance, updated_at")
+      .order("balance", { ascending: false });
+    if (error) throw error;
+    return data || [];
+  }
+
+  async function tick() {
+    try {
+      const wallets = await fetchWallets();
+      hideBanner();
+      setStatus("live");
+      render(wallets);
+    } catch (err) {
+      setStatus("error");
+      showBanner("error", `Errore nel leggere m2m_wallets: ${err.message || err}. Verifica URL/chiave e la policy RLS di lettura per il ruolo anon (vedi commento in cima al file).`);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Avvio
+  // ---------------------------------------------------------------
+  function start() {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      setStatus("error");
+      showBanner("config", "Configurazione mancante: imposta SUPABASE_URL e SUPABASE_ANON_KEY in cima al file (subito dopo <body>), poi ricarica la pagina.");
+      return;
+    }
+    const { createClient } = window.supabase; // esposta dallo script CDN caricato in <head>
+    dbClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    tick();
+    setInterval(tick, POLL_INTERVAL_MS);
+  }
+
+  tickClock();
+  setInterval(tickClock, 1000);
+  start();
+})();
+</script>
+</body>
+</html>

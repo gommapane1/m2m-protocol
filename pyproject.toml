@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "m2m-ledger"
+version = "0.1.0"
+description = "Decentralized Machine-to-Machine micro-payment protocol for AI Agents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# TODO (Founder): sostituisci con i tuoi dati reali prima di pubblicare --
+# questi sono placeholder, non li ho inventati per il pacchetto pubblicato.
+authors = [
+    { name = "Gabriele", email = "alazraqgabriele@gmail.com" },
+]
+keywords = ["m2m", "ai-agents", "micropayments", "websockets", "protocol", "autonomous-agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business :: Financial",
+    "Framework :: AsyncIO",
+]
+
+dependencies = [
+    # websockets<16 e' un vincolo REALE, non uno stile: supabase-py (via il
+    # suo sottopacchetto 'realtime') richiede websockets<16. Dichiarare solo
+    # ">=15.0.1" senza il tetto lascerebbe pip libero di risolvere su
+    # websockets 16.x e rompere l'installazione con un conflitto di
+    # dipendenze -- e' un problema che abbiamo gia' incontrato ed e' per
+    # questo che il tetto e' qui, esplicito.
+    "websockets>=15.0.1,<16",
+    "supabase>=2.0.0,<3",
+    "openai>=1.0.0,<3",
+    # Ed25519 (autenticazione crittografica dei passaporti): usiamo SOLO
+    # 'cryptography', non anche 'pynacl'. 'cryptography' e' gia' presente
+    # nella chiusura delle dipendenze (supabase -> supabase-auth -> pyjwt
+    # -> cryptography): dichiararla qui non aggiunge peso all'installazione,
+    # la rende solo esplicita e con una versione minima garantita.
+    # 'pynacl' offrirebbe la stessa identica capacita' Ed25519 ma come
+    # libreria nuova, con un proprio binario nativo (bindings a libsodium):
+    # ridondanza pura, l'ho lasciata fuori.
+    "cryptography>=41.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/gommapane1/m2m-ledger"
+Repository = "https://github.com/gommapane1/m2m-ledger"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/m2m_ledger"]
