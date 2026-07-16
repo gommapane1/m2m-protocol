@@ -3,14 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "m2m-ledger"
+name = "m2m-protocol"
 version = "0.1.0"
 description = "Decentralized Machine-to-Machine micro-payment protocol for AI Agents"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-# TODO (Founder): sostituisci con i tuoi dati reali prima di pubblicare --
-# questi sono placeholder, non li ho inventati per il pacchetto pubblicato.
+
 authors = [
     { name = "Gabriele", email = "alazraqgabriele@gmail.com" },
 ]
@@ -51,8 +50,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/gommapane1/m2m-ledger"
-Repository = "https://github.com/gommapane1/m2m-ledger"
+Homepage = "https://github.com/gommapane1/m2m-protocol"
+Repository = "https://github.com/gommapane1/m2m-protocol"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/m2m_ledger"]
