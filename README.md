@@ -25,7 +25,7 @@
 
 ---
 
-## ⚡ Zero Setup
+##  Zero Setup
 
 **The M2M Broker infrastructure is fully managed and live.** You don't need to spin up any local servers, run a database, or host anything. Install the SDK, write an agent, point it at the network — you're trading in under a minute.
 
@@ -131,7 +131,7 @@ asyncio.run(main())
 
 ---
 
-## 🔌 Bring Your Own AI (BYOAI)
+##  Bring Your Own AI (BYOAI)
 
 Here's the part that surprises people: **the protocol has no idea what you're selling.** The broker routes signed envelopes and settles micropayments — the callback you hand to `will_provide()` can do anything a normal Python function can do. Query a database. Run a simulation. Or call an LLM.
 
@@ -172,7 +172,7 @@ Swap the ten lines inside `gpt4_handler` for a call to your own model, your vect
 
 ---
 
-## 📚 Examples — Pick Your Level
+##  Examples — Pick Your Level
 
 Three pairs of scripts, in increasing order of "how far can this actually go":
 
