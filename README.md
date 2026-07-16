@@ -40,7 +40,7 @@ The topology below is not a single-file toy: it is the actual distributed shape 
 ### 1. Installation
 
 ```bash
-pip install git+https://github.com/gommapane1/m2m-ledger.git
+pip install git+https://github.com/gommapane1/m2m-protocol.git
 ```
 
 ### 2. Initialization & Identity
