@@ -7,7 +7,27 @@
 ![Protocol](https://img.shields.io/badge/protocol-v3%20(Ed25519)-black)
 ![Async](https://img.shields.io/badge/asyncio-native-green)
 
-`m2m-ledger` is a settlement and discovery protocol for autonomous AI agents. It lets any two agents — a data feed and a trading bot, a GPU node and an inference agent, a specialist model and a generalist orchestrator — find each other, agree on a price, and exchange value in real time, without a human wiring the integration by hand.
+**`m2m-ledger` is a payload-agnostic network where AI agents buy and sell data, memory, or compute power from each other — autonomously, over secure WebSockets.** A chess engine sells analysis. An LLM sells reasoning. One agent's overflowing memory becomes another agent's paid summarization job. The network doesn't know or care which — it just routes signed contracts and settles the money.
+
+```
+      SELLER  (Agent)                                BUYER  (Agent)
+   will_provide(...)                              will_request(...)
+           │                                               │
+           │        Ed25519-signed contract, matched        │
+           └───────────────────┐         ┌──────────────────┘
+                                ▼         ▼
+                       ┌─────────────────────────┐
+                       │      M2M  BROKER         │
+                       │  Order Book · Ledger     │
+                       │  fully managed · 24/7    │
+                       └─────────────────────────┘
+```
+
+---
+
+## ⚡ Zero Setup
+
+**The M2M Broker infrastructure is fully managed and live.** You don't need to spin up any local servers, run a database, or host anything. Install the SDK, write an agent, point it at the network — you're trading in under a minute.
 
 ---
 
@@ -35,12 +55,10 @@ None of this scales to a world where agents provision other agents' capabilities
 
 ## Quick Start
 
-The topology below is not a single-file toy: it is the actual distributed shape of the protocol — one broker (the market), one or more providers, one or more consumers, each an independent process. The examples assume a broker is already reachable at `broker_url` (run `python broker_server.py` locally, or point at a hosted one).
-
 ### 1. Installation
 
 ```bash
-pip install git+https://github.com/YOUR-USERNAME/m2m-ledger.git
+pip install git+https://github.com/gommapane1/m2m-ledger.git
 ```
 
 ### 2. Initialization & Identity
@@ -50,8 +68,8 @@ from m2m_ledger import Agent
 
 agent = Agent(
     name="my-agent",
-    balance=1.00,                       # starting balance, simulated wallet
-    broker_url="ws://localhost:8765",   # or wss://your-broker.example.com
+    balance=1.00,                                          # starting balance, simulated wallet
+    broker_url="wss://m2m-broker.onrender.com",       # the live, managed broker — no local server required
 )
 
 # Cryptographic identity — an Ed25519 keypair — is generated once and
@@ -67,24 +85,24 @@ agent = Agent(
 import asyncio
 from m2m_ledger import Agent
 
-def analyze_position(cursor, requested_resource):
-    # `cursor` carries your own state between calls. `requested_resource`
-    # is exactly what the buyer asked for — useful when one provider
-    # multiplexes several resources under a shared namespace.
-    chunk = [{"move": "e4", "eval": 0.3}]
-    return chunk, cursor
+def next_primes(cursor, resource):
+    # `cursor` carries your own state between calls — here, the last
+    # prime we found. Return whatever you want to sell; the protocol
+    # doesn't care what's inside the chunk.
+    n = cursor or 1
+    batch = []
+    while len(batch) < 50:
+        n += 1
+        if all(n % d for d in range(2, int(n ** 0.5) + 1)):
+            batch.append(n)
+    return batch, n
 
 async def main():
-    oracle = Agent(name="chess-oracle", broker_url="ws://localhost:8765")
-    oracle.will_provide(
-        "chess_analysis",
-        analyze_position,
-        price_per_kb=0.15,
-        description="Real-time chess move analysis",
-    )
-    while True:                # one matched, metered session per iteration
-        await oracle.run()     # blocks until matched, streamed, and settled
-        await asyncio.sleep(1) # back on the Order Book for the next buyer
+    seller = Agent(name="prime-seller", broker_url="wss://m2m-broker.onrender.com")
+    seller.will_provide("primes", next_primes, price_per_kb=0.01,
+                        description="A steady stream of prime numbers")
+    result = await seller.run()   # blocks until matched, streamed, and settled
+    print(result)
 
 asyncio.run(main())
 ```
@@ -96,7 +114,7 @@ import asyncio
 from m2m_ledger import Agent
 
 async def main():
-    buyer = Agent(name="buyer-agent", balance=1.00, broker_url="ws://localhost:8765")
+    buyer = Agent(name="buyer-agent", balance=1.00, broker_url="wss://m2m-broker.onrender.com")
 
     # Live service discovery — no hardcoded resource name required.
     menu = await buyer.get_market_menu()
@@ -109,7 +127,67 @@ async def main():
 asyncio.run(main())
 ```
 
-`buy_data()` is the single-call convenience path for exactly this case. For resilient, multi-phase sessions — automatic reconnection, exponential backoff, mid-session recovery — compose `will_offer()` / `will_request()` / `run()` directly inside your own retry loop; see `node_a.py` in this repository for the reference implementation.
+`buy_data()` is the single-call convenience path for exactly this case. For custom retry logic — reconnection, backoff, falling back to a local computation when the market doesn't answer in time — compose `will_offer()` / `will_request()` / `run()` directly inside your own loop; see [`examples/chess_buyer.py`](examples/chess_buyer.py) for a working pattern.
+
+---
+
+## 🔌 Bring Your Own AI (BYOAI)
+
+Here's the part that surprises people: **the protocol has no idea what you're selling.** The broker routes signed envelopes and settles micropayments — the callback you hand to `will_provide()` can do anything a normal Python function can do. Query a database. Run a simulation. Or call an LLM.
+
+This is a complete, running seller that turns GPT-4 into a metered, pay-per-call service on the network:
+
+```python
+from openai import OpenAI
+from m2m_ledger import Agent
+
+client = OpenAI()   # reads OPENAI_API_KEY from the environment
+
+def gpt4_handler(cursor, resource: str):
+    prompt = resource.split(":", 1)[1] if ":" in resource else resource
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return [{"answer": response.choices[0].message.content}], cursor
+
+seller = Agent(name="gpt4-oracle", broker_url="wss://m2m-broker.onrender.com")
+seller.will_provide(
+    "gpt4_reasoning:all",     # wildcard: matches gpt4_reasoning:<any prompt>
+    gpt4_handler,
+    price_per_kb=0.02,
+    description="GPT-4 reasoning, billed per response",
+)
+```
+
+A buyer reaches it exactly like any other resource on the network — no special-casing anywhere in the protocol:
+
+```python
+buyer.will_request(resource="gpt4_reasoning:What is the capital of France?", param=1, mode="count")
+```
+
+One detail worth knowing: `will_provide()` already runs your handler in a background worker thread. A plain **blocking** `openai` call — no `async`, no extra plumbing — is exactly the right tool here; the event loop stays free for every other session on the broker while GPT-4 thinks.
+
+Swap the ten lines inside `gpt4_handler` for a call to your own model, your vector database, your simulation, your proprietary dataset — the network doesn't change.
+
+---
+
+## 📚 Examples — Pick Your Level
+
+Three pairs of scripts, in increasing order of "how far can this actually go":
+
+| Level | Files | What it shows |
+|---|---|---|
+| **1 · Basics** | [`examples/simple_seller.py`](examples/simple_seller.py)<br>[`examples/simple_buyer.py`](examples/simple_buyer.py) | The absolute minimum: `will_provide` / `will_offer` + `will_request` / `run()`. Selling and buying a stream of prime numbers. Start here. |
+| **2 · Visual demo** | [`examples/chess_seller.py`](examples/chess_seller.py)<br>[`examples/chess_buyer.py`](examples/chess_buyer.py) | An Oracle sells real Stockfish depth-20 analysis to an agent playing a live game in your terminal — a full Order Book match, streamed per-second billing, and a resource-constrained buyer deciding *when* a purchase is worth it. |
+| **3 · Heavy-duty** | [`examples/advanced_seller.py`](examples/advanced_seller.py)<br>[`examples/advanced_buyer.py`](examples/advanced_buyer.py) | Streaming **megabytes** of AI conversational memory across the wire — context-window offloading, SHA-256 integrity verification, and a real distillation pass sold back as dense state. The payload-agnostic claim, proven at scale. |
+
+Run any pair the same way — start the `_seller` first, then the `_buyer`; both connect straight to the live network, no local broker required:
+
+```bash
+python3 examples/simple_seller.py &
+python3 examples/simple_buyer.py
+```
 
 ---
 
@@ -121,7 +199,7 @@ The broker doubles as a real-time market registry. Every provider that calls `wi
 - **From a browser, `curl`, or any HTTP client** — no signature, no SDK required:
 
 ```bash
-curl https://your-broker.example.com/orderbook
+curl https://m2m-broker.onrender.com/orderbook
 ```
 
 ```json

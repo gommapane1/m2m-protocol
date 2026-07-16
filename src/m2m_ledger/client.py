@@ -987,6 +987,7 @@ class Agent:
         self._offer_contract: Optional[dict] = None
         self._provision_contract: Optional[dict] = None
         self._provider_fn: Optional[Callable[[Any], Tuple[list, Any]]] = None
+        self._on_data: Optional[Callable[[str], None]] = None
         self._data_chunks: Optional[List[str]] = None
         self._data_idx = 0
         self._initial_balance = balance  # fisso alla creazione: serve da riferimento alla Utility Function
@@ -1133,7 +1134,8 @@ class Agent:
     def will_provide(self, resource: str, handler: Callable[[Any, str], Tuple[list, Any]], *,
                      price_per_sec: Optional[float] = None,
                      price_per_kb: Optional[float] = None,
-                     description: str = "") -> "Agent":
+                     description: str = "",
+                     on_data: Optional[Callable[[str], None]] = None) -> "Agent":
         """
         handler(cursor, resource_richiesta) -> (chunk, nuovo_cursor)
 
@@ -1144,8 +1146,21 @@ class Agent:
         l'handler riceve ESATTAMENTE cosa e' stato richiesto in QUESTA
         sessione, cosi' puo' decidere se restituire tutto o solo un filtro.
 
-        I parametri keyword sono il "listino" PUBBLICO del provider,
-        pensato per il Dynamic Order Book (service discovery):
+        on_data: callback opzionale, SINCRONA e veloce (tipicamente un
+        append a un buffer), invocata per OGNI data_chunk che il consumer
+        invia come sua meta' del baratto. Il broker ha SEMPRE inoltrato
+        questi chunk al provider (il protocollo di rete e' payload-agnostic
+        per costruzione); fino a questa versione, pero', il client SDK si
+        limitava a contarne i byte e li scartava -- il canale arrivava all'
+        80% del percorso e mancava l'ultimo metro fino all'handler. Con
+        on_data un provider puo' RICEVERE dati arbitrari dal consumer
+        (documenti, memorie conversazionali, dataset), elaborarli, e
+        restituire il risultato via handler: e' cio' che rende il baratto
+        (denaro+dati) <-> (calcolo) completo in entrambe le direzioni.
+        Parametro opzionale: tutti i provider esistenti restano invariati.
+
+        I parametri keyword di listino sono il "listino" PUBBLICO del
+        provider, pensato per il Dynamic Order Book (service discovery):
           * price_per_sec / price_per_kb -- tariffe indicative dichiarate;
           * description -- una riga di presentazione per i consumer.
         Sono INFORMATIVI: il regolamento economico dei tick resta governato
@@ -1165,6 +1180,7 @@ class Agent:
             contract["description"] = str(description)[:200]
         self._provision_contract = contract
         self._provider_fn = handler
+        self._on_data = on_data
         return self
 
     async def get_market_menu(self, *, stampa: bool = True) -> Optional[Dict[str, dict]]:
@@ -1604,6 +1620,15 @@ class Agent:
 
                 elif mtype == "data_chunk":
                     state["data_received"] += len(msg["chunk"])
+                    if self._on_data is not None:
+                        # Callback SINCRONA per contratto (tipicamente un
+                        # append): un'eccezione qui e' un bug del provider,
+                        # non deve abbattere la sessione ne' il tick loop.
+                        try:
+                            self._on_data(msg["chunk"])
+                        except Exception:
+                            logging.error(f"[{self.name}] on_data callback ha sollevato:\n"
+                                          f"{__import__('traceback').format_exc()}")
 
                 elif mtype == "settlement":
                     self.balance = msg["provider_balance"]
