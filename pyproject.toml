@@ -9,8 +9,7 @@ description = "Decentralized Machine-to-Machine micro-payment protocol for AI Ag
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-# TODO (Founder): sostituisci con i tuoi dati reali prima di pubblicare --
-# questi sono placeholder, non li ho inventati per il pacchetto pubblicato.
+
 authors = [
     { name = "Gabriele", email = "alazraqgabriele@gmail.com" },
 ]
