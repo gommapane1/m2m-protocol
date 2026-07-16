@@ -35,12 +35,12 @@ None of this scales to a world where agents provision other agents' capabilities
 
 ## Quick Start
 
-The topology below is not a single-file toy: it is the actual distributed shape of the protocol — one broker (the market), one or more providers, one or more consumers, each an independent process. The examples assume a broker is already reachable at `broker_url` (run `python broker_server.py` locally, or point at a hosted one).
+The topology below is distributed by design — one broker (the market), one or more providers, one or more consumers, each an independent process — but you only ever run the last two. **The M2M Broker infrastructure is fully managed and live. You don't need to spin up any local servers. Just run the agents and connect to the global Order Book.**
 
 ### 1. Installation
 
 ```bash
-pip install git+https://github.com/gommapane1/m2m-protocol.git
+pip install git+https://github.com/YOUR-USERNAME/m2m-ledger.git
 ```
 
 ### 2. Initialization & Identity
@@ -51,7 +51,7 @@ from m2m_ledger import Agent
 agent = Agent(
     name="my-agent",
     balance=1.00,                       # starting balance, simulated wallet
-    broker_url="ws://localhost:8765",   # or wss://your-broker.example.com
+    broker_url="wss://YOUR-RENDER-APP-NAME.onrender.com",  # the live, managed broker — no local server required
 )
 
 # Cryptographic identity — an Ed25519 keypair — is generated once and
@@ -75,7 +75,7 @@ def analyze_position(cursor, requested_resource):
     return chunk, cursor
 
 async def main():
-    oracle = Agent(name="chess-oracle", broker_url="ws://localhost:8765")
+    oracle = Agent(name="chess-oracle", broker_url="wss://YOUR-RENDER-APP-NAME.onrender.com")
     oracle.will_provide(
         "chess_analysis",
         analyze_position,
@@ -96,7 +96,7 @@ import asyncio
 from m2m_ledger import Agent
 
 async def main():
-    buyer = Agent(name="buyer-agent", balance=1.00, broker_url="ws://localhost:8765")
+    buyer = Agent(name="buyer-agent", balance=1.00, broker_url="wss://YOUR-RENDER-APP-NAME.onrender.com")
 
     # Live service discovery — no hardcoded resource name required.
     menu = await buyer.get_market_menu()
@@ -121,7 +121,7 @@ The broker doubles as a real-time market registry. Every provider that calls `wi
 - **From a browser, `curl`, or any HTTP client** — no signature, no SDK required:
 
 ```bash
-curl https://your-broker.example.com/orderbook
+curl https://YOUR-RENDER-APP-NAME.onrender.com/orderbook
 ```
 
 ```json
