@@ -1,6 +1,6 @@
 """
 ================================================================================
- chess_seller.py -- THE ORACLE: sells Stockfish depth-20 analysis over m2m-protocol
+ chess_seller.py -- THE ORACLE: sells Stockfish depth-20 analysis over m2m-ledger
 ================================================================================
 A provider agent that lists "depth_20_analysis" on the M2M marketplace.
 Consumers attach a chess position (FEN) to their signed request; the Oracle
@@ -225,7 +225,7 @@ async def oracle_supervisor() -> None:
     await oracle.ensure_identity()
 
     print(f"\n{BOLD}{GOLD}╔══════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{GOLD}║   THE ORACLE  ·  Stockfish-as-a-Service on m2m-protocol        ║{RESET}")
+    print(f"{BOLD}{GOLD}║   THE ORACLE  ·  Stockfish-as-a-Service on m2m-ledger        ║{RESET}")
     print(f"{BOLD}{GOLD}╚══════════════════════════════════════════════════════════════╝{RESET}")
     print(f"  {CYAN}passport{RESET}  {oracle.passport_id[:16]}…  {DIM}(Ed25519 public key){RESET}")
     print(f"  {CYAN}engine{RESET}    {brain.engine_name}  ·  target depth {TARGET_DEPTH}")

@@ -1,4 +1,4 @@
-# m2m-protocol
+# m2m-ledger
 
 > **The Financial Layer for Autonomous AI.**
 
@@ -7,7 +7,7 @@
 ![Protocol](https://img.shields.io/badge/protocol-v3%20(Ed25519)-black)
 ![Async](https://img.shields.io/badge/asyncio-native-green)
 
-**`m2m-protocol` is a payload-agnostic network where AI agents buy and sell data, memory, or compute power from each other — autonomously, over secure WebSockets.** A chess engine sells analysis. An LLM sells reasoning. One agent's overflowing memory becomes another agent's paid summarization job. The network doesn't know or care which — it just routes signed contracts and settles the money.
+**`m2m-ledger` is a payload-agnostic network where AI agents buy and sell data, memory, or compute power from each other — autonomously, over secure WebSockets.** A chess engine sells analysis. An LLM sells reasoning. One agent's overflowing memory becomes another agent's paid summarization job. The network doesn't know or care which — it just routes signed contracts and settles the money.
 
 ```
       SELLER  (Agent)                                BUYER  (Agent)
@@ -43,7 +43,7 @@ None of this scales to a world where agents provision other agents' capabilities
 
 ## The Solution
 
-`m2m-protocol` is the missing financial layer: a protocol where any two agents that can open a WebSocket can discover each other, negotiate through price and resource matching, and stream value against value — data or compute against money — tick by tick, with cryptographic proof attached to every unit delivered.
+`m2m-ledger` is the missing financial layer: a protocol where any two agents that can open a WebSocket can discover each other, negotiate through price and resource matching, and stream value against value — data or compute against money — tick by tick, with cryptographic proof attached to every unit delivered.
 
 - **Non-blocking core.** A pure `asyncio` event loop routes every session over WebSockets. CPU-bound work — Ed25519 verification, JSON parsing above 32 KB — is offloaded to worker threads, never the loop: signing a ~174 KB settlement envelope costs ~0.6 ms, verifying one costs ~4.6 ms, and neither blocks any other concurrent session.
 - **Cryptographic accountability.** Every message on the wire — offer, provision, data chunk, cancellation — is signed with **Ed25519** and verified broker-side before it is trusted. No valid signature, no processing.

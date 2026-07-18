@@ -1,34 +1,20 @@
-# --- Python ---
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-dist/
-*.egg-info/
-.eggs/
-
-# --- Ambienti virtuali ---
-.venv/
-venv/
-env/
-ENV/
-
-# --- Variabili d'ambiente / segreti locali ---
+# ─── Secrets & credentials (OPSEC) ───────────────────────────────────────────
 .env
 .env.*
+!.env.example
 
-# --- File generati a runtime da questo progetto (non vanno versionati) ---
-dataset.txt
-received_dataset.txt
+# Ed25519 agent identities: chiunque abbia questi file PUO' impersonare l'agente
+.*.agent_keys.json
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# ─── Logs & scratch ──────────────────────────────────────────────────────────
+logs/
 *.log
-
-# --- Editor / OS ---
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-*.agent_keys.json
-.env

@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guardian · m2m-ledger</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif; }
+  .mono { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; }
+  @keyframes radar { 0% { transform: scale(1); opacity: .5; } 100% { transform: scale(2.6); opacity: 0; } }
+  .radar { animation: radar 2.2s cubic-bezier(0,0,.2,1) infinite; }
+  .radar.d2 { animation-delay: 1.1s; }
+  @keyframes flashUp   { 0%,100% { color: #e5e5e5; } 30% { color: #4ade80; } }
+  @keyframes flashDown { 0%,100% { color: #e5e5e5; } 30% { color: #f87171; } }
+  .wallet-up   { animation: flashUp 1s ease; }
+  .wallet-down { animation: flashDown 1s ease; }
+  #chat::-webkit-scrollbar { width: 6px; }
+  #chat::-webkit-scrollbar-thumb { background: #262626; border-radius: 3px; }
+</style>
+</head>
+<body class="bg-neutral-950 text-neutral-200 min-h-screen flex justify-center">
+<div class="w-full max-w-2xl px-4 py-6 flex flex-col gap-5">
+
+  <!-- ═══ HEADER: identity · brain badge · wallet hub ═══ -->
+  <header class="flex items-center gap-4">
+    <div class="text-lg font-semibold tracking-tight select-none">
+      <span class="text-neutral-500">◆</span> Guardian
+    </div>
+
+    <button id="brainBadge" onclick="openSettings()"
+            class="ml-auto flex items-center gap-2 rounded-full border border-neutral-800
+                   bg-neutral-900 px-3 py-1.5 text-xs text-neutral-400 hover:border-neutral-600
+                   transition-colors">
+      <span id="brainDot" class="h-1.5 w-1.5 rounded-full bg-neutral-600"></span>
+      <span id="brainLabel">Connect your AI</span>
+    </button>
+
+    <div class="flex items-center gap-1.5 rounded-full border border-neutral-800 bg-neutral-900
+                px-3 py-1.5">
+      <span id="walletArrow" class="text-xs text-neutral-600">·</span>
+      <span id="wallet" class="mono text-sm text-neutral-200">$—</span>
+    </div>
+  </header>
+
+  <!-- ═══ MODE SWITCH ═══ -->
+  <div class="flex justify-center">
+    <div class="inline-flex rounded-full border border-neutral-800 bg-neutral-900 p-1">
+      <button id="tabBuyer" onclick="setMode('buyer')"
+              class="rounded-full px-6 py-1.5 text-sm transition-colors">Buyer</button>
+      <button id="tabSeller" onclick="setMode('seller')"
+              class="rounded-full px-6 py-1.5 text-sm transition-colors">Seller</button>
+    </div>
+  </div>
+
+  <!-- ═══ BUYER: the chat ═══ -->
+  <main id="buyerView" class="flex flex-col gap-3">
+    <div id="chat"
+         class="flex flex-col gap-2.5 rounded-2xl border border-neutral-800 bg-neutral-900/60
+                p-4 h-[26rem] overflow-y-auto">
+      <div class="self-center text-center text-xs text-neutral-500 max-w-sm py-2">
+        Talk to your AI. If it ever needs the market, you'll see the receipt here —
+        nothing else.
+      </div>
+    </div>
+    <form id="composer" class="flex gap-2">
+      <input id="box" type="text" autocomplete="off" placeholder="Message your AI…"
+             class="flex-1 rounded-xl border border-neutral-800 bg-neutral-900 px-4 py-3
+                    text-sm outline-none placeholder:text-neutral-600
+                    focus:border-neutral-500 transition-colors">
+      <button id="send" type="submit"
+              class="rounded-xl bg-neutral-100 px-5 py-3 text-sm font-medium text-neutral-900
+                     hover:bg-white disabled:opacity-40 disabled:cursor-wait transition-all">
+        Send
+      </button>
+    </form>
+  </main>
+
+  <!-- ═══ SELLER: the listening node ═══ -->
+  <main id="sellerView" class="hidden flex-col items-center gap-8 rounded-2xl border
+                               border-neutral-800 bg-neutral-900/60 py-16">
+    <div class="relative flex h-24 w-24 items-center justify-center">
+      <span class="radar absolute h-full w-full rounded-full border border-emerald-500/60"></span>
+      <span class="radar d2 absolute h-full w-full rounded-full border border-emerald-500/40"></span>
+      <span class="h-3 w-3 rounded-full bg-emerald-400"></span>
+    </div>
+    <div class="text-center">
+      <div class="text-sm font-medium tracking-widest text-emerald-400 uppercase">Listening</div>
+      <div class="mt-1 text-xs text-neutral-500">
+        Your AI is listed on the market. Incoming requests are answered by
+        <span id="sellerModel" class="text-neutral-300">—</span> and you earn per tick.
+      </div>
+    </div>
+    <div class="flex gap-10 text-center">
+      <div>
+        <div id="sellerSessions" class="mono text-2xl text-neutral-100">0</div>
+        <div class="mt-1 text-[11px] uppercase tracking-wider text-neutral-500">Requests served</div>
+      </div>
+      <div>
+        <div id="sellerEarned" class="mono text-2xl text-emerald-400">$0.000000</div>
+        <div class="mt-1 text-[11px] uppercase tracking-wider text-neutral-500">Earned</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ═══ SETTINGS: the Brain Connector ═══ -->
+  <div id="settings" class="fixed inset-0 z-50 hidden items-center justify-center
+                            bg-black/70 backdrop-blur-sm">
+    <div class="w-full max-w-sm rounded-2xl border border-neutral-800 bg-neutral-950 p-6
+                shadow-2xl">
+      <div class="text-sm font-semibold">Connect your AI</div>
+      <div class="mt-1 text-xs text-neutral-500">
+        Your key stays in this app's memory — never written to disk, never logged.
+      </div>
+
+      <label class="mt-5 block text-[11px] uppercase tracking-wider text-neutral-500">Engine</label>
+      <select id="fProvider" onchange="applyPreset()"
+              class="mt-1 w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2
+                     text-sm outline-none focus:border-neutral-500">
+        <option value="ollama">Local Ollama</option>
+        <option value="openai">OpenAI</option>
+        <option value="anthropic">Anthropic</option>
+        <option value="custom">Custom (OpenAI-compatible)</option>
+      </select>
+
+      <label class="mt-3 block text-[11px] uppercase tracking-wider text-neutral-500">Endpoint</label>
+      <input id="fBase" type="text" spellcheck="false"
+             class="mono mt-1 w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3
+                    py-2 text-xs outline-none focus:border-neutral-500">
+
+      <label class="mt-3 block text-[11px] uppercase tracking-wider text-neutral-500">Model</label>
+      <input id="fModel" type="text" spellcheck="false"
+             class="mono mt-1 w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3
+                    py-2 text-xs outline-none focus:border-neutral-500">
+
+      <label class="mt-3 block text-[11px] uppercase tracking-wider text-neutral-500">API key</label>
+      <input id="fKey" type="password" placeholder="not needed for Ollama"
+             class="mono mt-1 w-full rounded-lg border border-neutral-800 bg-neutral-900 px-3
+                    py-2 text-xs outline-none focus:border-neutral-500">
+
+      <div id="fError" class="mt-3 hidden text-xs text-red-400"></div>
+
+      <div class="mt-5 flex gap-2">
+        <button onclick="saveBrain()"
+                class="flex-1 rounded-lg bg-neutral-100 py-2 text-sm font-medium
+                       text-neutral-900 hover:bg-white transition-colors">Save</button>
+        <button onclick="closeSettings()"
+                class="rounded-lg border border-neutral-800 px-4 py-2 text-sm text-neutral-400
+                       hover:border-neutral-600 transition-colors">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let state = { mode: "buyer", wallet: null, ai: {} };
+let prevWallet = null;
+
+const PRESETS = {
+  ollama:    { base: "http://localhost:11434/v1", model: "qwen2.5:7b" },
+  openai:    { base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  anthropic: { base: "https://api.anthropic.com/v1/", model: "claude-haiku-4-5" },
+  custom:    { base: "", model: "" },
+};
+
+/* ── chat helpers ─────────────────────────────────────────────────────── */
+function bubble(kind, text) {
+  const d = document.createElement("div");
+  if (kind === "user")
+    d.className = "self-end max-w-[80%] rounded-2xl rounded-br-sm bg-neutral-800 " +
+                  "px-4 py-2.5 text-sm";
+  else if (kind === "ai")
+    d.className = "self-start max-w-[80%] rounded-2xl rounded-bl-sm border " +
+                  "border-neutral-800 px-4 py-2.5 text-sm text-neutral-300 whitespace-pre-wrap";
+  else if (kind === "receipt")
+    d.className = "self-start mono text-[11px] text-amber-400/90 border border-dashed " +
+                  "border-amber-500/30 rounded-lg px-3 py-1.5";
+  else
+    d.className = "self-center text-xs text-neutral-500";
+  d.textContent = text;
+  $("chat").appendChild(d);
+  $("chat").scrollTop = $("chat").scrollHeight;
+}
+
+/* ── mode switch ──────────────────────────────────────────────────────── */
+function paintMode() {
+  const buyer = state.mode === "buyer";
+  $("buyerView").classList.toggle("hidden", !buyer);
+  $("sellerView").classList.toggle("hidden", buyer);
+  $("sellerView").classList.toggle("flex", !buyer);
+  $("tabBuyer").className  = "rounded-full px-6 py-1.5 text-sm transition-colors " +
+    (buyer ? "bg-neutral-100 text-neutral-900 font-medium" : "text-neutral-400 hover:text-neutral-200");
+  $("tabSeller").className = "rounded-full px-6 py-1.5 text-sm transition-colors " +
+    (!buyer ? "bg-emerald-400 text-neutral-900 font-medium" : "text-neutral-400 hover:text-neutral-200");
+}
+
+async function setMode(mode) {
+  if (mode === state.mode) return;
+  const r = await (await fetch("/api/mode", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }) })).json();
+  if (!r.ok) { openSettings(); return; }        // seller richiede l'AI connessa
+  state.mode = r.mode;
+  paintMode();
+}
+
+/* ── status polling: wallet direction, brain badge, seller stats ──────── */
+async function poll() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    state.mode = s.mode; state.ai = s.ai;
+    paintMode();
+
+    const w = $("wallet");
+    w.textContent = "$" + s.wallet.toFixed(6);
+    if (prevWallet !== null && s.wallet !== prevWallet) {
+      const up = s.wallet > prevWallet;
+      $("walletArrow").textContent = up ? "▲" : "▼";
+      $("walletArrow").className = "text-xs " + (up ? "text-emerald-400" : "text-red-400");
+      w.classList.remove("wallet-up", "wallet-down");
+      void w.offsetWidth;
+      w.classList.add(up ? "wallet-up" : "wallet-down");
+    }
+    prevWallet = s.wallet;
+
+    if (s.ai.configured) {
+      $("brainDot").className = "h-1.5 w-1.5 rounded-full bg-emerald-400";
+      $("brainLabel").textContent = s.ai.model;
+    } else {
+      $("brainDot").className = "h-1.5 w-1.5 rounded-full bg-neutral-600";
+      $("brainLabel").textContent = "Connect your AI";
+    }
+
+    $("sellerModel").textContent = s.ai.model || "—";
+    $("sellerSessions").textContent = s.seller.sessions;
+    $("sellerEarned").textContent = "$" + s.seller.earned_total.toFixed(6);
+  } catch (_) { /* backend restarting */ }
+}
+setInterval(poll, 1000);
+poll();
+
+/* ── chat flow ────────────────────────────────────────────────────────── */
+$("composer").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const text = $("box").value.trim();
+  if (!text) return;
+  bubble("user", text);
+  $("box").value = "";
+  $("send").disabled = true;
+  try {
+    const r = await (await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text }) })).json();
+    if (r.source === "ai") {
+      const buys = (r.steps || []).filter(s => s.tool === "buy_from_market" && s.ok);
+      for (const b of buys) bubble("receipt", `⇄ bought on m2m · $${(b.paid ?? 0).toFixed(6)}`);
+      bubble("ai", r.reply);
+    } else if (r.source === "unconfigured") {
+      bubble("system", r.reply); openSettings();
+    } else {
+      bubble("system", r.reply);
+    }
+  } catch (e) {
+    bubble("system", "backend unreachable");
+  } finally {
+    $("send").disabled = false;
+    $("box").focus();
+    poll();
+  }
+});
+
+/* ── the Brain Connector ──────────────────────────────────────────────── */
+function openSettings() {
+  applyPresetIfEmpty();
+  $("settings").classList.remove("hidden");
+  $("settings").classList.add("flex");
+}
+function closeSettings() {
+  $("settings").classList.add("hidden");
+  $("settings").classList.remove("flex");
+  $("fError").classList.add("hidden");
+}
+function applyPreset() {
+  const p = PRESETS[$("fProvider").value];
+  $("fBase").value = p.base;
+  $("fModel").value = p.model;
+}
+function applyPresetIfEmpty() {
+  if (!$("fBase").value && !$("fModel").value) applyPreset();
+}
+async function saveBrain() {
+  const body = { provider: $("fProvider").value, api_key: $("fKey").value,
+                 base_url: $("fBase").value, model: $("fModel").value };
+  const res = await fetch("/api/brain", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body) });
+  const r = await res.json();
+  if (!res.ok) {
+    $("fError").textContent = r.error || "invalid configuration";
+    $("fError").classList.remove("hidden");
+    return;
+  }
+  $("fKey").value = "";
+  closeSettings();
+  poll();
+}
+</script>
+</body>
+</html>

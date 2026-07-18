@@ -109,7 +109,47 @@ HANDSHAKE_TIMEOUT_SEC = float(os.environ.get("M2M_HANDSHAKE_TIMEOUT", "10"))
 OFFLOAD_JSON_BYTES = 32 * 1024
 
 # ------------------------------------------------------------------------------
-# TRACING ASINCRONO ESPLICITO
+# RATE LIMITING CRITTOGRAFICO (per-passaporto, NON per-IP)
+# ------------------------------------------------------------------------------
+# Difesa DDoS agganciata all'identita' Ed25519, non all'indirizzo di rete:
+# un bot dietro mille IP ma con un solo passaporto viene comunque limitato,
+# e un IP condiviso (NAT, proxy) non penalizza utenti legittimi distinti.
+# Un attaccante che ruota i passaporti paga il costo di generare/firmare
+# nuove identita' a ogni richiesta -- il rate limit alza quel costo.
+# Token bucket in memoria: RATE_LIMIT_RPS token/secondo, burst fino a
+# RATE_LIMIT_BURST. Un messaggio consuma un token; a secco, e' scartato.
+RATE_LIMIT_RPS = float(os.environ.get("M2M_RATE_LIMIT_RPS", "10"))
+RATE_LIMIT_BURST = float(os.environ.get("M2M_RATE_LIMIT_BURST", str(RATE_LIMIT_RPS)))
+RATE_LIMIT_ENABLED = os.environ.get("M2M_RATE_LIMIT", "1") != "0"
+
+
+class RateLimiter:
+    """Token bucket per chiave (qui: il passaporto Ed25519). Puro, sincrono,
+    O(1) per check -- nessun lock: il broker gira su un unico event loop, i
+    check non sono mai concorrenti tra loro."""
+
+    def __init__(self, rps: float = RATE_LIMIT_RPS, burst: float = RATE_LIMIT_BURST) -> None:
+        self.rps = rps
+        self.burst = burst
+        self._buckets: Dict[str, Tuple[float, float]] = {}   # key -> (tokens, last_ts)
+
+    def allow(self, key: str) -> bool:
+        """True se c'e' un token (consumandolo), False se la chiave e' a secco."""
+        now = time.monotonic()
+        tokens, last = self._buckets.get(key, (self.burst, now))
+        # Ricarica proporzionale al tempo trascorso, fino al tetto di burst.
+        tokens = min(self.burst, tokens + (now - last) * self.rps)
+        if tokens < 1.0:
+            self._buckets[key] = (tokens, now)
+            return False
+        self._buckets[key] = (tokens - 1.0, now)
+        return True
+
+    def forget(self, key: str) -> None:
+        """Libera il bucket di un client disconnesso (igiene memoria)."""
+        self._buckets.pop(key, None)
+
+
 # ------------------------------------------------------------------------------
 # Ogni await "di ciclo di vita" (connessione, handshake, attesa peer,
 # chiusura) e' preceduto E seguito da una riga di trace: se un processo si
@@ -388,6 +428,7 @@ class Broker:
         self.offers: Dict[str, dict] = {}       # passaporto (consumer) -> contratto offerto
         self.provisions: Dict[str, dict] = {}   # passaporto (provider) -> risorsa fornita
         self.session_of: Dict[str, "StreamSession"] = {}
+        self._rate_limiter = RateLimiter() if RATE_LIMIT_ENABLED else None
         self._server = None
 
     async def start(self, process_request=None) -> None:
@@ -549,6 +590,23 @@ class Broker:
                 passport_id = busta["passport"]
                 mtype = msg.get("type")
 
+                # --- RATE LIMIT CRITTOGRAFICO (per-passaporto) -------------
+                # Applicato DOPO la verifica firma (l'identita' e' certa) e
+                # su TUTTO tranne l'hello, che apre il wallet una sola volta.
+                # A differenza del rifiuto crittografico, qui NON tronchiamo
+                # la connessione: scartiamo il singolo messaggio in eccesso e
+                # rispondiamo con un errore, cosi' un client legittimo che va
+                # troppo veloce rallenta invece di essere disconnesso.
+                if (self._rate_limiter is not None and mtype != "hello"
+                        and not self._rate_limiter.allow(passport_id)):
+                    logging.warning(f"[BROKER] RATE_LIMIT_EXCEEDED per {passport_id[:12]}… "
+                                    f"(mtype={mtype}) -- messaggio scartato.")
+                    try:
+                        await ws.send(json.dumps({"error": "RATE_LIMIT_EXCEEDED"}))
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+                    continue
+
                 if mtype == "hello":
                     self.connections[passport_id] = ws
                     balance = await self.ledger.open_wallet(passport_id, msg.get("initial_balance", 0.0))
@@ -619,6 +677,8 @@ class Broker:
                 # che al peer realmente in ascolto in quel momento.
                 self.offers.pop(passport_id, None)
                 self.provisions.pop(passport_id, None)
+                if self._rate_limiter is not None:
+                    self._rate_limiter.forget(passport_id)
 
     @staticmethod
     def _resource_compatible(provided: str, requested: str) -> bool:

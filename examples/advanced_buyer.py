@@ -2,7 +2,7 @@
 ================================================================================
  advanced_buyer.py -- THE OVERFLOWING MIND: an AI that pays to forget wisely
 ================================================================================
-An advanced m2m-protocol consumer. This agent's short-term memory (its context
+An advanced m2m-ledger consumer. This agent's short-term memory (its context
 window) is full: a megabyte-scale JSON array of conversation history, tool
 traces and raw embeddings. Rather than truncating blindly, it goes to the
 market and buys the `compress_cognitive_memory` service:

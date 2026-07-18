@@ -2,7 +2,7 @@
 ================================================================================
  advanced_seller.py -- THE MEMORY REFINERY: buys raw context, sells distilled state
 ================================================================================
-An advanced m2m-protocol provider demonstrating that the protocol is fully
+An advanced m2m-ledger provider demonstrating that the protocol is fully
 PAYLOAD-AGNOSTIC: the broker routes Ed25519-signed envelopes and settles
 micropayments -- it neither knows nor cares that the bytes flowing through
 it are a megabyte-scale AI conversation memory.
@@ -211,7 +211,7 @@ async def refinery_supervisor() -> None:
     await seller.ensure_identity()
 
     print(f"\n{BOLD}{GOLD}╔══════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{GOLD}║   MEMORY REFINERY  ·  context distillation on m2m-protocol     ║{RESET}")
+    print(f"{BOLD}{GOLD}║   MEMORY REFINERY  ·  context distillation on m2m-ledger     ║{RESET}")
     print(f"{BOLD}{GOLD}╚══════════════════════════════════════════════════════════════╝{RESET}")
     print(f"  {CYAN}passport{RESET}  {seller.passport_id[:16]}…  {DIM}(Ed25519){RESET}")
     print(f"  {CYAN}listing{RESET}   {RESOURCE}  @  ${PRICE_PER_SEC}/sec + ${PRICE_PER_KB}/KB")

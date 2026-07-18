@@ -1,5 +1,5 @@
 """
-m2m-protocol -- protocollo di micro-pagamento Machine-to-Machine per agenti AI.
+m2m-ledger -- protocollo di micro-pagamento Machine-to-Machine per agenti AI.
 
 USO TIPICO (lato sviluppatore esterno: un agente che compra o vende una
 risorsa attraverso un broker gia' ospitato da qualcun altro):
@@ -33,7 +33,7 @@ from importlib.metadata import PackageNotFoundError, version
 from .client import Agent, DEFAULT_BROKER_URL, MAX_MESSAGE_SIZE, PROTOCOL_VERSION
 
 try:
-    __version__ = version("m2m-protocol")
+    __version__ = version("m2m-ledger")
 except PackageNotFoundError:
     # Il pacchetto non e' installato (es. si sta eseguendo codice direttamente
     # da un checkout sorgente senza `pip install -e .`): non e' un errore
