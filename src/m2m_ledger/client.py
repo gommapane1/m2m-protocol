@@ -122,6 +122,12 @@ RATE_LIMIT_RPS = float(os.environ.get("M2M_RATE_LIMIT_RPS", "10"))
 RATE_LIMIT_BURST = float(os.environ.get("M2M_RATE_LIMIT_BURST", str(RATE_LIMIT_RPS)))
 RATE_LIMIT_ENABLED = os.environ.get("M2M_RATE_LIMIT", "1") != "0"
 
+# Grace window del matchmaking mirato: quanto un consumer con requisiti
+# (es. max_price) attende un provider compatibile PRIMA di ricevere
+# no_nodes_available. Sfrutta la macchina di matching esistente -- un
+# provider che si connette entro la finestra viene abbinato normalmente.
+MATCH_GRACE_SEC = float(os.environ.get("M2M_MATCH_GRACE", "8"))
+
 
 class RateLimiter:
     """Token bucket per chiave (qui: il passaporto Ed25519). Puro, sincrono,
@@ -886,25 +892,58 @@ class Broker:
             return requested.startswith(namespace)
         return False
 
+    @staticmethod
+    def _prezzo_provider(provision: dict) -> float:
+        """Prezzo dichiarato nel manifesto firmato (will_provide): somma delle
+        due componenti gia' presenti nel contratto. E' la metrica di ordinamento
+        per il match economico -- un singolo scalare confrontabile con max_price."""
+        return round(float(provision.get("price_per_sec", 0.0) or 0.0)
+                     + float(provision.get("price_per_kb", 0.0) or 0.0), 8)
+
     async def _try_match(self) -> None:
-        """Abbina la prima coppia (offerta consumer, disponibilita' provider)
-        compatibile sulla stessa risorsa (vedi _resource_compatible).
-        Indipendente dall'ordine di arrivo: funziona sia che parta prima
-        node_a.py sia prima node_b.py."""
+        """Abbina offerta consumer <-> disponibilita' provider. Due fasi:
+          1. filtro di COMPATIBILITA': stessa risorsa (_resource_compatible)
+             e, se il consumer ha dichiarato max_price, prezzo del provider
+             entro il tetto;
+          2. SELEZIONE: tra i provider validi, il PIU' ECONOMICO
+             (_prezzo_provider). Senza max_price e con un solo candidato, il
+             comportamento e' identico a prima -- nessuna regressione.
+        Indipendente dall'ordine di arrivo dei due nodi."""
         for consumer_id, offer in list(self.offers.items()):
-            wanted_resource = offer["request"]["resource"]
+            request = offer["request"]
+            wanted_resource = request["resource"]
+            max_price = request.get("max_price")
+
+            # -- fase 1: raccogli i provider compatibili (+ entro il tetto) --
+            candidati = []
             for provider_id, provision in list(self.provisions.items()):
-                if provider_id == consumer_id or not self._resource_compatible(provision["resource"], wanted_resource):
+                if provider_id == consumer_id:
                     continue
-                del self.offers[consumer_id]
-                del self.provisions[provider_id]
-                session = StreamSession(self, consumer_id, provider_id, offer, provision)
-                self.session_of[consumer_id] = session
-                self.session_of[provider_id] = session
-                logging.info(f"[BROKER] match trovato: {consumer_id[:12]}… <-> {provider_id[:12]}… "
-                             f"('{provision['resource']}' soddisfa '{wanted_resource}')")
-                asyncio.create_task(session.run())
-                return
+                if not self._resource_compatible(provision["resource"], wanted_resource):
+                    continue
+                if max_price is not None and self._prezzo_provider(provision) > max_price + 1e-9:
+                    continue
+                candidati.append((provider_id, provision))
+
+            if not candidati:
+                continue  # per questo consumer nessun match ORA: resta in attesa (grace lato client)
+
+            # -- fase 2: il piu' economico vince (tie-break: ordine stabile) --
+            provider_id, provision = min(candidati, key=lambda pv: self._prezzo_provider(pv[1]))
+
+            del self.offers[consumer_id]
+            del self.provisions[provider_id]
+            session = StreamSession(self, consumer_id, provider_id, offer, provision)
+            self.session_of[consumer_id] = session
+            self.session_of[provider_id] = session
+            prezzo = self._prezzo_provider(provision)
+            logging.info(f"[BROKER] match trovato: {consumer_id[:12]}… <-> {provider_id[:12]}… "
+                         f"('{provision['resource']}' soddisfa '{wanted_resource}'"
+                         + (f", prezzo {prezzo} <= max {max_price}, "
+                            f"il piu' economico tra {len(candidati)}" if max_price is not None else "")
+                         + ")")
+            asyncio.create_task(session.run())
+            return
 
 
 # ==============================================================================
@@ -1316,7 +1355,8 @@ class Agent:
         return self
 
     def will_request(self, resource: str, param: Any = None, mode: str = "count",
-                      on_tick: Optional[Callable[[dict], Optional[str]]] = None) -> "Agent":
+                      on_tick: Optional[Callable[[dict], Optional[str]]] = None,
+                      max_price: Optional[float] = None) -> "Agent":
         """
         mode="count" (default): `param` e' un NUMERO DI UNITA' da raccogliere
         (es. 8000 numeri primi) -- comportamento originale.
@@ -1325,6 +1365,14 @@ class Agent:
         "quante unita' totali" non ha un significato naturale). `param=None`
         in modalita' "duration" significa "senza limite": lo streaming
         prosegue finche' non finiscono i fondi o qualcuno si disconnette.
+
+        max_price: tetto opzionale al prezzo del provider. Se impostato, il
+        broker abbina SOLO provider il cui prezzo dichiarato (price_per_sec
+        + price_per_kb, i campi gia' firmati nel manifesto will_provide) e'
+        <= max_price, e tra quelli sceglie il PIU' ECONOMICO. Se nessun
+        provider compatibile rientra nel tetto entro la grace window, il
+        risultato di run() e' {"type": "no_nodes_available"}. Ometterlo
+        mantiene il comportamento storico (match sulla sola risorsa).
 
         on_tick: aggancio opzionale per una Utility Function del consumer.
         Viene chiamato DOPO ogni liquidazione con un dict
@@ -1339,7 +1387,10 @@ class Agent:
         """
         if self._offer_contract is None:
             self._offer_contract = {}
-        self._offer_contract["request"] = {"resource": resource, "param": param, "mode": mode}
+        req = {"resource": resource, "param": param, "mode": mode}
+        if max_price is not None:
+            req["max_price"] = float(max_price)
+        self._offer_contract["request"] = req
         self._on_tick = on_tick
         return self
 
@@ -1702,12 +1753,49 @@ class Agent:
         settled_ticks = 0     # ultimo tick LIQUIDATO dal broker: e' la verita' contabile
         paid_total = 0.0      # somma delle liquidazioni viste da QUESTA sessione
 
+        # Grace window: applichiamo un timeout SOLO all'attesa del primo
+        # 'matched'. Se il consumer ha dichiarato requisiti stringenti
+        # (max_price) e nessun provider compatibile+conveniente compare entro
+        # la finestra, restituiamo no_nodes_available invece di attendere per
+        # sempre. Dopo il match, la ricezione torna bloccante come sempre
+        # (una sessione in corso non ha motivo di scadere qui).
+        matched_yet = False
+        grace_deadline = time.monotonic() + MATCH_GRACE_SEC
+
         try:
-            async for raw in self._ws:
+            while True:
+                if not matched_yet:
+                    residuo = grace_deadline - time.monotonic()
+                    if residuo <= 0:
+                        trace(self.name, "grace window scaduta senza match -- no_nodes_available.")
+                        logging.info(f"[{self.name}] nessun nodo compatibile entro "
+                                     f"{MATCH_GRACE_SEC:.0f}s -- no_nodes_available.")
+                        return {
+                            "role": self._role_label(), "type": "no_nodes_available",
+                            "reason": "no_matching_provider_within_grace",
+                            "resource": self._offer_contract.get("request", {}).get("resource"),
+                            "max_price": self._offer_contract.get("request", {}).get("max_price"),
+                            "ticks": 0, "total_paid": 0.0, "results_sample": [],
+                        }
+                    try:
+                        raw = await asyncio.wait_for(self._ws.recv(), timeout=residuo)
+                    except (asyncio.TimeoutError, TimeoutError):
+                        continue   # ricontrolla il deadline in cima al loop
+                else:
+                    raw = await self._ws.recv()
+
                 msg = await _json_loads_smart(raw)   # i result_chunk 'crypto:all' pesano centinaia di KB
+                if "error" in msg and "type" not in msg:
+                    # Rifiuto esplicito del broker (es. RATE_LIMIT_EXCEEDED):
+                    # nessun 'type' di protocollo -- lo riportiamo come esito.
+                    logging.warning(f"[{self.name}] il broker ha risposto con errore: {msg['error']}")
+                    return {"role": self._role_label(), "type": "errore_broker",
+                            "reason": msg["error"], "ticks": settled_ticks,
+                            "total_paid": paid_total, "results_sample": list(results_sample)}
                 mtype = msg["type"]
 
                 if mtype == "matched":
+                    matched_yet = True
                     trace(self.name, f"matched ricevuto (peer {str(msg.get('peer'))[:12]}…) -- streaming avviato.")
                     logging.info(f"[{self.name}] abbinato al peer {msg['peer']} -- inizio dello streaming.")
                     await self._send_next_data_chunk()
