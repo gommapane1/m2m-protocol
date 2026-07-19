@@ -52,7 +52,7 @@ except ImportError:
 logging.getLogger().setLevel(logging.WARNING)
 
 # The M2M Broker infrastructure is fully managed and live: no local servers.
-BROKER_URL = os.environ.get("M2M_BROKER_URL", "wss://YOUR-RENDER-APP.onrender.com")
+BROKER_URL = os.environ.get("M2M_BROKER_URL", "wss://m2m-broker.onrender.com")
 RESOURCE_NAMESPACE = "local_llm_inference"
 
 # Ollama locale del VENDITORE: e' il suo hardware a lavorare.
