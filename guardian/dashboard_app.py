@@ -188,13 +188,83 @@ def build_router_prompt(local_model_name: Optional[str]) -> str:
     )
 
 ROUTER_PICK_PROMPT = (
-    "You are a resource picker. Given a user request and a list of marketplace "
-    "listings, pick exactly one resource that clearly covers the request. Some "
-    "sellers describe sub-resources (e.g. weather_data:<city>): build the full "
-    "resource string. Reply with ONLY a JSON object, nothing else: "
-    '{"resource": "<full resource string>", "ticks": <1-10>} '
-    'or {"resource": null} if no listing clearly covers the request.'
+    "You are a machine-to-machine task compiler for an AI marketplace. Given a "
+    "human request and a list of marketplace listings, you do TWO things:\n"
+    "1. Pick exactly one resource that clearly covers the request (some sellers "
+    "describe sub-resources like weather_data:<city> — build the full resource "
+    "string). If nothing clearly covers it, the resource is null.\n"
+    "2. If you picked a resource, compile a STRICT machine-to-machine sub-prompt "
+    "that will be sent to the remote seller node in place of the raw human text. "
+    "This sub-prompt must command the seller to perform the task and reply with "
+    "ONLY a JSON object and NOTHING else — no preamble, no markdown, no prose — "
+    "matching exactly this schema:\n"
+    '  {"result": <the answer, string or number>, '
+    '"unit": <string or null>, '
+    '"detail": <short string or null>}\n'
+    "The sub-prompt must explicitly restate that schema to the seller and forbid "
+    "any text outside the JSON object.\n"
+    "Reply with ONLY a JSON object, nothing else:\n"
+    '{"resource": "<full resource string or null>", "ticks": <1-10>, '
+    '"sub_prompt": "<the M2M sub-prompt, or null if no resource>"}'
 )
+
+# Schema che il payload del venditore DEVE rispettare dopo il parsing. Tenuto
+# volutamente piatto e minimale: piu' lo schema e' stretto, piu' e' robusta la
+# validazione e meno spazio ha un modello remoto di "creativizzare" l'output.
+M2M_RESULT_SCHEMA_KEYS = {"result", "unit", "detail"}
+
+
+def validate_m2m_payload(obj) -> Optional[dict]:
+    """Valida in modo SICURO il JSON tornato dal venditore contro lo schema
+    piatto {result, unit, detail}. Ritorna un dict normalizzato (chiavi
+    garantite, tipi coerenti) o None se non conforme -- mai un'eccezione,
+    mai fiducia cieca nel formato remoto."""
+    if not isinstance(obj, dict) or "result" not in obj:
+        return None
+    result = obj.get("result")
+    # result deve essere un valore scalare mostrabile, non una struttura.
+    if not isinstance(result, (str, int, float, bool)):
+        return None
+    unit = obj.get("unit")
+    detail = obj.get("detail")
+    return {
+        "result": result,
+        "unit": unit if isinstance(unit, str) else None,
+        "detail": detail if isinstance(detail, str) else None,
+    }
+
+
+def extract_json_object(raw: str) -> Optional[dict]:
+    """Estrae il PRIMO oggetto JSON bilanciato da una stringa, tollerando
+    preamboli/markdown che un modello remoto indisciplinato potrebbe
+    aggiungere nonostante le istruzioni. Scansione a conteggio di graffe
+    (gestisce oggetti annidati) invece di un fragile find/rfind."""
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(raw[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 def _print_router_error(stage: str, exc: Exception) -> None:
@@ -243,7 +313,9 @@ async def route_decision(message: str) -> int:
 
 
 async def route_pick(message: str, listings: list) -> Optional[dict]:
-    """Sceglie la risorsa dal book, o None se nulla e' pertinente."""
+    """Sceglie la risorsa dal book E compila il sub-prompt M2M che impone al
+    venditore lo schema JSON rigido. Ritorna {resource, ticks, sub_prompt}
+    oppure None se nulla e' pertinente."""
     try:
         resp = await router_client.chat.completions.create(
             model=ROUTER_MODEL, temperature=0,
@@ -251,13 +323,25 @@ async def route_pick(message: str, listings: list) -> Optional[dict]:
                       {"role": "user", "content":
                        f"Request: {message}\n\nListings: {json.dumps(listings)}"}])
         raw = (resp.choices[0].message.content or "").strip()
-        print(f"[ROUTER] pick raw={raw[:200]!r}", flush=True)
-        text = raw[raw.find("{"): raw.rfind("}") + 1]
-        pick = json.loads(text)
-        if pick.get("resource"):
-            return {"resource": str(pick["resource"]),
-                    "ticks": max(1, min(int(pick.get("ticks", 4)), 10))}
-        return None
+        print(f"[ROUTER] pick raw={raw[:280]!r}", flush=True)
+        pick = extract_json_object(raw)
+        if not pick or not pick.get("resource"):
+            return None
+        resource = str(pick["resource"])
+        sub_prompt = pick.get("sub_prompt")
+        # Fallback difensivo: se il 70B ha scelto la risorsa ma non ha
+        # prodotto un sub-prompt valido, ne sintetizziamo uno minimo noi --
+        # il contratto con il venditore (JSON-only) non deve mai saltare.
+        if not isinstance(sub_prompt, str) or not sub_prompt.strip():
+            sub_prompt = (
+                f"Task: {message}\n"
+                "Respond with ONLY a JSON object and nothing else — no preamble, "
+                "no markdown, no prose. Schema: "
+                '{"result": <string or number>, "unit": <string or null>, '
+                '"detail": <short string or null>}.')
+        return {"resource": resource,
+                "ticks": max(1, min(int(pick.get("ticks", 4)), 10)),
+                "sub_prompt": sub_prompt}
     except Exception as exc:
         _print_router_error("pick", exc)
         return None
@@ -540,9 +624,10 @@ async def agent_turn(user_message: str, tools_schema: list) -> dict:
 
 
 async def market_chain(user_message: str) -> tuple:
-    """La catena di piattaforma (router=1): browse -> pick -> buy.
-    Ritorna (nota_per_il_worker, steps). Ogni esito -- incluso il fallimento
-    -- diventa contesto per il Worker: e' lui a formulare la risposta finale."""
+    """La catena di piattaforma (router=1): browse -> pick(+compila sub-prompt)
+    -> buy(inviando il sub-prompt, non il grezzo) -> valida il JSON del
+    venditore. Ritorna (nota_per_il_worker, steps). Ogni esito -- incluso il
+    fallimento o un JSON non conforme -- diventa contesto per il Worker."""
     steps = []
     book = await guardian.browse_market()
     steps.append({"tool": "browse_market", "ok": bool(book.get("ok")), "paid": None})
@@ -553,15 +638,65 @@ async def market_chain(user_message: str) -> tuple:
     if pick is None:
         return ("[Market note] Nothing currently listed on the m2m marketplace "
                 "covers this request; no purchase was made.", steps)
-    bought = await guardian.buy_from_market(pick["resource"], pick["ticks"])
+
+    # Il payload inviato al venditore e' il SUB-PROMPT compilato dal 70B, non
+    # il testo grezzo dell'utente: <namespace>:<sub_prompt>. Il namespace e'
+    # la parte prima dei ':' della risorsa scelta; cio' che segue e' cio' che
+    # il nodo venditore ricevera' come prompt da processare.
+    namespace = pick["resource"].split(":", 1)[0]
+    wire_resource = f"{namespace}:{pick['sub_prompt']}"
+    print(f"[ROUTER] M2M sub-prompt → seller: {pick['sub_prompt'][:160]!r}", flush=True)
+
+    bought = await guardian.buy_from_market(wire_resource, pick["ticks"])
     steps.append({"tool": "buy_from_market", "ok": bool(bought.get("ok")),
                   "paid": bought.get("paid")})
-    if bought.get("ok"):
-        return (f"[Acquired market data] resource={pick['resource']} · "
-                f"paid ${bought['paid']:.6f} over {bought['ticks']} ticks\n"
-                f"{bought['data']}", steps)
-    return (f"[Market note] The purchase of {pick['resource']} failed "
-            f"({bought.get('error')}); no data is available.", steps)
+    if not bought.get("ok"):
+        return (f"[Market note] The purchase failed ({bought.get('error')}); "
+                "no data is available.", steps)
+
+    # --- Validazione sicura del JSON tornato dal venditore -----------------
+    # bought["data"] e' la serializzazione JSON di results_sample (una lista
+    # di chunk). Il payload utile del venditore e' l'ultimo dict con un campo
+    # 'answer' (per un seller LLM) o direttamente lo schema. Cerchiamo il JSON
+    # strutturato ovunque nella risposta, poi lo validiamo contro lo schema.
+    validated = None
+    raw_seller = ""
+    try:
+        sample = json.loads(bought["data"]) if isinstance(bought["data"], str) else bought["data"]
+        if isinstance(sample, list):
+            for item in reversed(sample):
+                if not isinstance(item, dict):
+                    continue
+                # caso 1: il seller ha gia' restituito lo schema piatto
+                cand = validate_m2m_payload(item)
+                if cand:
+                    validated = cand
+                    break
+                # caso 2: il seller LLM ha incapsulato la risposta in 'answer'
+                answer = item.get("answer")
+                if isinstance(answer, str):
+                    raw_seller = answer
+                    obj = extract_json_object(answer)
+                    cand = validate_m2m_payload(obj) if obj else None
+                    if cand:
+                        validated = cand
+                        break
+    except Exception as exc:
+        print(f"[ROUTER] payload parse error: {type(exc).__name__}: {exc}", flush=True)
+
+    receipt = f"paid ${bought['paid']:.6f} over {bought['ticks']} ticks"
+    if validated is not None:
+        # Payload conforme: lo consegniamo al Worker gia' strutturato e pulito.
+        return (f"[Acquired market data · validated JSON] {receipt}\n"
+                f"resource={pick['resource']}\n"
+                f"{json.dumps(validated)}", steps)
+
+    # JSON non conforme o assente: il venditore ha ignorato lo schema. Non
+    # inventiamo nulla -- lo diciamo al Worker, che ne terra' conto.
+    snippet = (raw_seller or str(bought.get("data", "")))[:400]
+    print(f"[ROUTER] seller payload did NOT match schema; raw snippet={snippet!r}", flush=True)
+    return (f"[Market note · unstructured] {receipt}, but the seller's response did "
+            f"not match the required JSON schema. Raw response fragment: {snippet}", steps)
 
 
 # ==============================================================================
