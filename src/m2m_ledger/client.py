@@ -359,16 +359,183 @@ class SupabaseLedger:
         }
 
 
+# ==============================================================================
+# 1-ter. L'ASYNCPG-LEDGER -- Postgres nativo, cache write-back + flush batched
+# ==============================================================================
+class AsyncpgLedger:
+    """
+    Stessa interfaccia di MicroLedger/SupabaseLedger, ma su Postgres nativo
+    via asyncpg (nessuna REST di mezzo). Pensato per il pricing a tick, che
+    farebbe altrimenti una scrittura per frazione di centesimo:
+
+      * I saldi vivono in cache RAM (fonte di verita' OPERATIVA durante la
+        sessione); balance_of() e transfer() non toccano MAI il DB nel
+        percorso caldo del tick -- zero latenza di rete per micro-pagamento.
+      * Ogni transfer marca i due passaporti come "dirty". Un task in
+        background fa UPDATE dei soli saldi dirty ogni FLUSH_INTERVAL secondi,
+        e flush() e' invocato ISTANTANEAMENTE alla disconnessione del client.
+        Il DB e' quindi eventualmente-consistente entro pochi secondi, ma
+        diventa immediatamente consistente ai confini di sessione (dove conta).
+      * Un asyncio.Lock serializza i micro-pagamenti concorrenti prima del
+        flush: nessuna race sul saldo, la garanzia trustless (mai sotto zero)
+        e' preservata identica a MicroLedger.
+
+    Nota di durabilita' onesta: tra due flush, un saldo aggiornato vive solo
+    in RAM. Un crash improvviso del broker puo' perdere fino a FLUSH_INTERVAL
+    secondi di micro-pagamenti gia' 'visti' come riusciti dai client. E' il
+    trade-off esplicito richiesto per non martellare il DB; le disconnessioni
+    ordinate (il caso comune: fine inferenza) flushano subito e non perdono
+    nulla.
+    """
+
+    FLUSH_INTERVAL = float(os.environ.get("M2M_FLUSH_INTERVAL", "5"))
+
+    def __init__(self, pool) -> None:
+        self._pool = pool
+        self._cache: Dict[str, float] = {}
+        self._dirty: set = set()
+        self._lock = asyncio.Lock()
+        self._transactions: List[dict] = []
+        self._flush_task: Optional[asyncio.Task] = None
+
+    @classmethod
+    async def create(cls, dsn: str) -> "AsyncpgLedger":
+        """Crea il pool, la tabella se manca, e avvia il task di flush."""
+        import asyncpg
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wallets (
+                    ed25519_pubkey TEXT PRIMARY KEY,
+                    balance NUMERIC(20, 8) NOT NULL DEFAULT 0
+                );
+                """
+            )
+        self = cls(pool)
+        self._flush_task = asyncio.create_task(self._flush_loop())
+        return self
+
+    async def open_wallet(self, passport_id: str, initial_balance: float = 0.0) -> float:
+        """Onboarding atomico: se la pubkey esiste, carica il saldo dal DB;
+        se non esiste, la crea col saldo iniziale. INSERT ... ON CONFLICT
+        DO NOTHING + SELECT, cosi' un riavvio del broker non azzera un
+        agente gia' noto (il saldo persistito vince sul valore dichiarato)."""
+        if passport_id in self._cache:
+            return self._cache[passport_id]
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO wallets (ed25519_pubkey, balance)
+                VALUES ($1, $2)
+                ON CONFLICT (ed25519_pubkey) DO UPDATE SET balance = wallets.balance
+                RETURNING balance;
+                """,
+                passport_id, round(initial_balance, 8),
+            )
+        saldo = float(row["balance"])
+        self._cache[passport_id] = saldo
+        return saldo
+
+    def balance_of(self, passport_id: str) -> float:
+        return self._cache.get(passport_id, 0.0)
+
+    async def transfer(self, sender: str, receiver: str, amount: float, memo: str = "") -> bool:
+        """Sposta amount in RAM sotto lock (percorso caldo del tick), marca i
+        due wallet come dirty per il prossimo flush. La garanzia 'mai sotto
+        zero' e' applicata qui, identica a MicroLedger."""
+        async with self._lock:
+            amount = round(amount, 8)
+            if amount <= 0:
+                return False
+            if self._cache.get(sender, 0.0) + 1e-9 < amount:
+                return False
+            self._cache[sender] = round(self._cache[sender] - amount, 8)
+            self._cache[receiver] = round(self._cache.get(receiver, 0.0) + amount, 8)
+            self._dirty.update((sender, receiver))
+            self._transactions.append(
+                {"ts": time.time(), "from": sender, "to": receiver, "amount": amount, "memo": memo}
+            )
+            return True
+
+    async def flush(self, passports=None) -> None:
+        """UPDATE dei saldi dirty (o solo di `passports`, per il flush mirato
+        alla disconnessione). Snapshot sotto lock, poi scrittura fuori dal
+        lock in UNA transazione: il percorso caldo non si blocca sul DB."""
+        async with self._lock:
+            target = (self._dirty if passports is None
+                      else self._dirty.intersection(passports))
+            if not target:
+                return
+            snapshot = [(p, self._cache[p]) for p in target]
+            self._dirty.difference_update(target)
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO wallets (ed25519_pubkey, balance)
+                    VALUES ($1, $2)
+                    ON CONFLICT (ed25519_pubkey) DO UPDATE SET balance = EXCLUDED.balance;
+                    """,
+                    snapshot,
+                )
+        except Exception as exc:
+            # Scrittura fallita: rimarca dirty, il prossimo flush riprovera'.
+            logging.error(f"[LEDGER] flush su Postgres fallito, ritento al prossimo giro: {exc}")
+            async with self._lock:
+                self._dirty.update(p for p, _ in snapshot)
+
+    async def _flush_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.FLUSH_INTERVAL)
+                await self.flush()
+            except asyncio.CancelledError:
+                await self.flush()          # ultimo flush prima di spegnersi
+                raise
+            except Exception as exc:
+                logging.error(f"[LEDGER] errore nel task di flush: {exc}")
+
+    async def aclose(self) -> None:
+        """Spegnimento pulito: ferma il task, flush finale, chiudi il pool."""
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        await self.flush()
+        await self._pool.close()
+
+    def summary(self) -> dict:
+        return {
+            "wallets": dict(self._cache),
+            "totale_in_circolazione": round(sum(self._cache.values()), 6),
+            "transazioni_liquidate": len(self._transactions),
+        }
+
+
 async def create_ledger():
     """
-    Fabbrica del Ledger. Prova Supabase (persistenza reale: i saldi
-    sopravvivono ai riavvii, incluso lo spin-down automatico del piano
-    Free di Render); se le credenziali non ci sono, o la libreria non e'
-    installata, o la connessione fallisce per qualunque motivo, degrada
-    IN MODO PULITO al Ledger in sola RAM -- mai un crash per un problema
-    di persistenza opzionale: la persistenza e' un miglioramento, non un
-    prerequisito per far funzionare il protocollo.
+    Fabbrica del Ledger. Ordine di preferenza:
+      1. DATABASE_URL  -> AsyncpgLedger (Postgres nativo, flush batched);
+      2. SUPABASE_URL/KEY -> SupabaseLedger (REST, legacy);
+      3. nessuna delle due -> MicroLedger (solo RAM).
+    Ogni fallimento degrada IN MODO PULITO al livello successivo: la
+    persistenza e' un miglioramento, mai un prerequisito per funzionare.
     """
+    dsn = os.environ.get("DATABASE_URL")
+    if dsn:
+        try:
+            ledger = await AsyncpgLedger.create(dsn)
+            logging.info("[LEDGER] connesso a Postgres via asyncpg: persistenza attiva "
+                         "sulla tabella 'wallets' (flush batched).")
+            return ledger
+        except ImportError:
+            logging.warning("[LEDGER] 'asyncpg' non installato (pip install asyncpg): "
+                            "provo Supabase o RAM.")
+        except Exception as exc:
+            logging.warning(f"[LEDGER] connessione Postgres fallita ({exc}): provo Supabase o RAM.")
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_KEY")
 
@@ -452,6 +619,13 @@ class Broker:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+        # Chiusura pulita del ledger persistente: flush finale + pool chiuso.
+        _aclose = getattr(self.ledger, "aclose", None)
+        if _aclose is not None:
+            try:
+                await _aclose()
+            except Exception as exc:
+                logging.error(f"[BROKER] chiusura del ledger fallita: {exc}")
 
     # ---- Dynamic Order Book (service discovery) ---------------------------
     @staticmethod
@@ -679,6 +853,16 @@ class Broker:
                 self.provisions.pop(passport_id, None)
                 if self._rate_limiter is not None:
                     self._rate_limiter.forget(passport_id)
+                # Flush ISTANTANEO del saldo alla disconnessione (fine
+                # inferenza o drop): il DB diventa consistente subito ai
+                # confini di sessione, senza attendere il task periodico.
+                _flush = getattr(self.ledger, "flush", None)
+                if _flush is not None:
+                    try:
+                        await _flush({passport_id})
+                    except Exception as exc:
+                        logging.error(f"[BROKER] flush su disconnessione fallito per "
+                                      f"{passport_id[:12]}…: {exc}")
 
     @staticmethod
     def _resource_compatible(provided: str, requested: str) -> bool:
