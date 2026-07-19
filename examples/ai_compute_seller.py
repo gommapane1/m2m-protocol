@@ -32,9 +32,11 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -50,13 +52,28 @@ except ImportError:
 logging.getLogger().setLevel(logging.WARNING)
 
 # The M2M Broker infrastructure is fully managed and live: no local servers.
-BROKER_URL = os.environ.get("M2M_BROKER_URL", "wss://m2m-broker.onrender.com")
+BROKER_URL = os.environ.get("M2M_BROKER_URL", "wss://YOUR-RENDER-APP.onrender.com")
 RESOURCE_NAMESPACE = "local_llm_inference"
 
 # Ollama locale del VENDITORE: e' il suo hardware a lavorare.
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
-OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
+
+# ─── SANDBOXING HARDWARE (fase 2) ────────────────────────────────────────────
+# Difesa contro 'infinite generation': un acquirente malintenzionato non puo'
+# piu' far macinare la GPU/CPU del fornitore all'infinito.
+#   * MAX_OUTPUT_TOKENS -> num_predict di Ollama: tetto INVALICABILE ai token
+#     generati per richiesta. E' l'armatura vera: limita il lavoro alla radice.
+#   * OLLAMA_TIMEOUT_SEC -> timeout assoluto sulla chiamata: se l'inferenza si
+#     blocca o eccede, il nodo taglia, libera l'hardware e restituisce errore.
+# Entrambi env-configurabili: un fornitore con GPU potente li alza e si fa
+# pagare di piu' (il pricing a token e' gia' proporzionale all'output).
+MAX_OUTPUT_TOKENS = int(os.environ.get("OLLAMA_MAX_TOKENS", "800"))
+OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT", "45"))
+# Cap sul prompt IN INGRESSO: un input enorme fa lavorare il prefill della GPU
+# anche se l'output e' limitato da num_predict. Controllato PRIMA del POST:
+# oltre soglia, la richiesta e' respinta senza toccare Ollama.
+MAX_INPUT_CHARS = int(os.environ.get("OLLAMA_MAX_INPUT_CHARS", "4000"))
 
 # Prezzo dinamico: pavimento per-richiesta + componente per-token generato.
 PRICE_PER_REQUEST = float(os.environ.get("PRICE_PER_REQUEST", "0.002"))
@@ -76,25 +93,50 @@ GOLD, CYAN, GREEN, RED = "\033[33m", "\033[36m", "\033[32m", "\033[31m"
 def run_ollama(prompt: str) -> dict:
     """POST bloccante a Ollama /api/generate (stream=false). Ritorna un dict
     denso col testo e la contabilita' dei token, o {'error': ...} -- il
-    buyer (e la sua AI) devono VEDERE il fallimento, non un crash."""
-    payload = json.dumps({"model": OLLAMA_MODEL, "prompt": prompt,
-                          "stream": False}).encode("utf-8")
+    buyer (e la sua AI) devono VEDERE il fallimento, non un crash.
+
+    ARMATURA HARDWARE: num_predict impone il tetto ai token generati (la GPU
+    non puo' essere costretta a produrne di piu'); il timeout assoluto taglia
+    un'inferenza bloccata o troppo lenta e libera la macchina."""
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        # options.num_predict: hard cap INVALICABILE sui token in output.
+        # E' Ollama stesso a fermare la generazione a questa soglia.
+        "options": {"num_predict": MAX_OUTPUT_TOKENS},
+    }).encode("utf-8")
     req = urllib.request.Request(OLLAMA_URL, data=payload,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_SEC) as r:
             data = json.loads(r.read().decode("utf-8"))
+    except socket.timeout:
+        # Timeout assoluto colpito: la urlopen ha gia' chiuso la socket, quindi
+        # l'hardware del fornitore e' liberato. L'errore torna al buyer sul
+        # ledger (paghera' solo i tick gia' maturati durante lo streaming).
+        return {"error": "inference_timeout",
+                "detail": f"exceeded {OLLAMA_TIMEOUT_SEC:.0f}s hard timeout — aborted"}
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.timeout):
+            return {"error": "inference_timeout",
+                    "detail": f"exceeded {OLLAMA_TIMEOUT_SEC:.0f}s hard timeout — aborted"}
+        return {"error": "ollama_failure", "detail": f"{type(exc).__name__}: {reason}"}
     except Exception as exc:
         return {"error": "ollama_failure", "detail": f"{type(exc).__name__}: {exc}"}
 
     prompt_tok = int(data.get("prompt_eval_count", 0))
     gen_tok = int(data.get("eval_count", 0))
     cost = round(PRICE_PER_REQUEST + gen_tok * PRICE_PER_TOKEN, 8)
+    # done_reason == "length" => la generazione e' stata tagliata dal cap.
+    capped = data.get("done_reason") == "length" or gen_tok >= MAX_OUTPUT_TOKENS
     return {
         "model": data.get("model", OLLAMA_MODEL),
         "response": data.get("response", ""),
         "tokens": {"prompt": prompt_tok, "generated": gen_tok,
-                   "total": prompt_tok + gen_tok},
+                   "total": prompt_tok + gen_tok, "cap": MAX_OUTPUT_TOKENS,
+                   "truncated_by_cap": bool(capped)},
         "pricing": {"per_request": PRICE_PER_REQUEST, "per_token": PRICE_PER_TOKEN,
                     "quoted_cost": cost},
         "eval_duration_sec": round(data.get("eval_duration", 0) / 1e9, 3),
@@ -109,6 +151,11 @@ def run_ollama(prompt: str) -> dict:
 # ==============================================================================
 class InferenceJob:
     def __init__(self) -> None:
+        # Mutex di concorrenza: UNA inferenza alla volta su questo nodo.
+        # threading.Lock (non asyncio): il lavoro vero gira in un thread, e il
+        # check nell'handler e' sincrono. try-acquire non bloccante -> se e'
+        # gia' preso, si rifiuta subito invece di accodare.
+        self._lock = threading.Lock()
         self.reset()
 
     def reset(self) -> None:
@@ -116,9 +163,18 @@ class InferenceJob:
         self.result = None
         self.t0 = time.perf_counter()
 
-    def start(self, prompt: str) -> None:
+    @property
+    def is_processing(self) -> bool:
+        return self._lock.locked()
+
+    def try_start(self, prompt: str) -> bool:
+        """Prova a prendere il lock e avviare l'inferenza. False se il nodo
+        e' gia' occupato -- il chiamante rifiutera' con node_busy."""
+        if not self._lock.acquire(blocking=False):
+            return False
         self.reset()
         threading.Thread(target=self._work, args=(prompt,), daemon=True).start()
+        return True
 
     def _work(self, prompt: str) -> None:
         try:
@@ -127,20 +183,41 @@ class InferenceJob:
             self.result = {"error": "worker_crash", "detail": f"{type(exc).__name__}: {exc}"}
         finally:
             self.done = True
+            self._lock.release()                       # hardware liberato: prossimo cliente ammesso
 
 
 def make_handler(job: InferenceJob):
-    """cursor: None -> avvia l'inferenza sul thread; poi tick vuoti di
-    progress finche' Ollama macina; infine UN chunk col testo generato."""
+    """cursor: None -> valida input, prende il mutex, avvia l'inferenza sul
+    thread; poi tick vuoti di progress finche' Ollama macina; infine UN chunk
+    col testo generato. Rifiuti (input troppo lungo / nodo occupato) sono
+    consegnati come UN chunk-errore che chiude subito la sessione."""
     def handler(cursor, resource: str):
         if cursor is None:
             prompt = resource.split(":", 1)[1] if ":" in resource else ""
+
+            # --- GUARDIA 1: cap input, PRIMA di toccare Ollama --------------
+            if len(prompt) > MAX_INPUT_CHARS:
+                print(f"\n{RED}✗ input_prompt_too_long{RESET}  "
+                      f"{len(prompt)} > {MAX_INPUT_CHARS} chars — rejected before dispatch")
+                return [{"error": "input_prompt_too_long",
+                         "detail": f"{len(prompt)} chars exceeds the {MAX_INPUT_CHARS} limit"}], \
+                       {"phase": "rejected"}
+
+            # --- GUARDIA 2: mutex single-job -------------------------------
+            if not job.try_start(prompt):
+                print(f"\n{GOLD}✗ node_busy_capacity_full{RESET}  "
+                      f"another inference is already running — rejected")
+                return [{"error": "node_busy_capacity_full",
+                         "detail": "this compute node processes one request at a time"}], \
+                       {"phase": "rejected"}
+
             preview = (prompt[:60] + "…") if len(prompt) > 61 else prompt
             print(f"\n{GOLD}{BOLD}◆ INFERENCE REQUEST{RESET}  {DIM}model={OLLAMA_MODEL}{RESET}")
-            print(f"  {CYAN}prompt{RESET} {preview!r}")
+            print(f"  {CYAN}prompt{RESET} {preview!r}  {DIM}({len(prompt)} chars){RESET}")
             print(f"  {DIM}dispatching to local Ollama — buyer pays for compute time{RESET}")
-            job.start(prompt)
             return [], {"phase": "generating"}
+        if cursor.get("phase") == "rejected":
+            return [], cursor                          # gia' consegnato l'errore, sessione chiusa
         if not job.done:
             return [], cursor                          # progress: paga il tempo
         result = job.result or {"error": "no_result"}
@@ -176,6 +253,8 @@ async def compute_supervisor() -> None:
     print(f"  {CYAN}passport{RESET}  {seller.passport_id[:16]}…  {DIM}(Ed25519){RESET}")
     print(f"  {CYAN}model{RESET}     {OLLAMA_MODEL}  {DIM}(via {OLLAMA_URL}){RESET}")
     print(f"  {CYAN}pricing{RESET}   ${PRICE_PER_REQUEST}/request + ${PRICE_PER_TOKEN}/token")
+    print(f"  {CYAN}armor{RESET}     max {MAX_OUTPUT_TOKENS} tok out · {MAX_INPUT_CHARS} chars in · "
+          f"{OLLAMA_TIMEOUT_SEC:.0f}s timeout · 1 job/node")
     print(f"  {CYAN}broker{RESET}    {BROKER_URL}\n")
 
     backoff, session_n = BACKOFF_START, 0
