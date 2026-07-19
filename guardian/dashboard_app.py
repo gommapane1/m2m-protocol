@@ -48,12 +48,24 @@ try:
     # Cerca .env accanto a questo script e risalendo fino alla cwd: funziona
     # sia lanciando da guardian/ sia dalla root del progetto.
     _here = Path(__file__).resolve().parent
+    _env_found = None
     for _cand in (_here / ".env", _here.parent / ".env", Path.cwd() / ".env"):
         if _cand.is_file():
             load_dotenv(_cand)
+            _env_found = _cand
             break
     else:
         load_dotenv()          # fallback: ricerca automatica di python-dotenv
+    # Log esplicito: un .env non trovato e' la causa #1 di un router che
+    # "fallisce in silenzio" (ROUTER_API_KEY vuoto -> router_client None ->
+    # degrado al Worker). Renderlo visibile all'avvio, non a runtime.
+    if _env_found:
+        print(f"  [env] loaded credentials from {_env_found}", flush=True)
+    else:
+        print("  [env] WARNING: no .env file found (looked next to the script, "
+              "in its parent, and in the current directory). Router/DB "
+              "credentials must come from real environment variables, or the "
+              "router will stay disabled.", flush=True)
 except ImportError:
     pass                        # python-dotenv assente: si usano solo le env di sistema
 
@@ -103,6 +115,11 @@ BRAIN_PRESETS = {
     "ollama":    {"base_url": "http://localhost:11434/v1", "model": "qwen2.5:7b"},
     "openai":    {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
     "anthropic": {"base_url": "https://api.anthropic.com/v1/", "model": "claude-haiku-4-5"},
+    # Groq: pesca dinamicamente da ENV (stesse variabili del Router, cosi' un
+    # solo .env configura entrambi). Se vuoi Groq anche come Worker, seleziona
+    # "groq" nel Brain Connector: eredita endpoint e modello dal .env.
+    "groq":      {"base_url": os.environ.get("ROUTER_BASE_URL", "https://api.groq.com/openai/v1"),
+                  "model": os.environ.get("ROUTER_MODEL", "llama-3.3-70b-versatile")},
     "custom":    {"base_url": "", "model": ""},
 }
 
@@ -166,6 +183,16 @@ ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "gpt-4o-mini")
 router_client: Optional[AsyncOpenAI] = (
     AsyncOpenAI(api_key=ROUTER_API_KEY, base_url=ROUTER_BASE_URL)
     if ROUTER_API_KEY else None)
+
+# Diagnostica esplicita: se il Router e' disabilitato, DEVE essere ovvio
+# all'avvio -- e' la causa #1 del "mercato bloccato / sub-prompt null".
+if router_client is not None:
+    print(f"  [router] ACTIVE · model={ROUTER_MODEL} · endpoint={ROUTER_BASE_URL}", flush=True)
+else:
+    print("  [router] DISABLED: ROUTER_API_KEY is empty. The Two-Brain routing "
+          "and the M2M sub-prompt compiler are OFF; the Worker runs autonomously "
+          "with all tools. Set ROUTER_API_KEY in your .env to enable the router.",
+          flush=True)
 
 def build_router_prompt(local_model_name: Optional[str]) -> str:
     """Prompt dinamico del Gatekeeper: il Router valuta il task rispetto alle
@@ -396,6 +423,7 @@ class Guardian:
         self.network_status = "idle"
         self.market_live = None
         self.seller_task: Optional[asyncio.Task] = None
+        self.seller_online = False           # il nodo e' in vetrina? (indip. dal tab)
         self.seller_stats = {"active": False, "sessions": 0, "earned_total": 0.0}
         self._market_lock = asyncio.Lock()
         self._mode_lock = asyncio.Lock()
@@ -505,28 +533,46 @@ class Guardian:
         finally:
             self.seller_stats["active"] = False
 
+    # ---- Start/Stop del nodo venditore, indipendenti dal tab selezionato ----
+    async def start_seller(self) -> dict:
+        """Mette l'IA dell'utente in vetrina sul mercato. Idempotente."""
+        if not brain.configured:
+            return {"ok": False, "error": "connect_your_ai_first"}
+        if self.seller_task and not self.seller_task.done():
+            return {"ok": True, "online": True}       # gia' online
+        self.seller.balance = self.buyer.balance      # vista wallet coerente
+        self.seller_online = True
+        self.seller_task = asyncio.create_task(self.seller_supervisor())
+        return {"ok": True, "online": True}
+
+    async def stop_seller(self) -> dict:
+        """Ritira l'IA dal mercato con DISCONNESSIONE PULITA: cancella il
+        supervisore, il cui finally chiude il WebSocket (handshake di
+        chiusura, non un taglio secco); il broker, vedendo la disconnessione,
+        rimuove il nodo dalla vetrina -> niente task fantasma. Idempotente."""
+        if self.seller_task:
+            self.seller_task.cancel()
+            try:
+                await self.seller_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.seller_task = None
+        self.buyer.balance = self.seller.balance      # riporta il guadagnato
+        self.seller_online = False
+        return {"ok": True, "online": False}
+
     async def set_mode(self, mode: str) -> dict:
+        """Cambia il tab. Passare a 'buyer' RITIRA sempre il nodo dal mercato
+        (disconnessione pulita) -- non si vende mentre si e' nel tab acquisti.
+        Passare a 'seller' NON mette automaticamente online: l'utente decide
+        con Start, cosi' entrare nel tab per curiosare non pubblica l'IA."""
         async with self._mode_lock:
-            if mode == self.mode:
-                return {"ok": True, "mode": self.mode}
-            if mode == "seller":
-                if not brain.configured:
-                    return {"ok": False, "error": "connect_your_ai_first"}
-                self.seller.balance = self.buyer.balance     # vista coerente
-                self.seller_task = asyncio.create_task(self.seller_supervisor())
-                self.mode = "seller"
-                return {"ok": True, "mode": "seller"}
-            # -> buyer: spegni il nodo venditore; il broker pulisce la vetrina
-            if self.seller_task:
-                self.seller_task.cancel()
-                try:
-                    await self.seller_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                self.seller_task = None
-            self.buyer.balance = self.seller.balance         # vista coerente
-            self.mode = "buyer"
-            return {"ok": True, "mode": "buyer"}
+            if mode not in ("buyer", "seller"):
+                return {"ok": False, "error": "mode must be buyer|seller"}
+            if mode == "buyer" and self.seller_online:
+                await self.stop_seller()
+            self.mode = mode
+            return {"ok": True, "mode": self.mode, "online": self.seller_online}
 
 
 guardian = Guardian()
@@ -740,6 +786,7 @@ async def status() -> JSONResponse:
         "market_live": guardian.market_live,
         "ai": brain.public_view(),
         "seller": guardian.seller_stats,
+        "seller_online": guardian.seller_online,
         "router": {"configured": router_client is not None,
                    "model": ROUTER_MODEL if router_client else None},
         "passport": (guardian.buyer.passport_id or "")[:12] + "…",
@@ -768,6 +815,22 @@ async def mode_set(body: ModeIn) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "mode must be buyer|seller"},
                             status_code=400)
     out = await guardian.set_mode(body.mode)
+    return JSONResponse(out, status_code=200 if out["ok"] else 400)
+
+
+class SellerIn(BaseModel):
+    action: str          # "start" | "stop"
+
+
+@app.post("/api/seller")
+async def seller_control(body: SellerIn) -> JSONResponse:
+    if body.action == "start":
+        out = await guardian.start_seller()
+    elif body.action == "stop":
+        out = await guardian.stop_seller()
+    else:
+        return JSONResponse({"ok": False, "error": "action must be start|stop"},
+                            status_code=400)
     return JSONResponse(out, status_code=200 if out["ok"] else 400)
 
 
